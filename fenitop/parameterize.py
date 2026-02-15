@@ -70,6 +70,7 @@ class DensityFilter():
         self.T_mat_transpose = self.T_mat.copy()
         self.T_mat_transpose.transpose()
 
+
     def forward(self):
         """Compute the filtered variables."""
         self.T_mat.mult(self.rho.x.petsc_vec, self.vec_s)

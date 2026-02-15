@@ -58,11 +58,17 @@ def topopt(fem, opt):
     linear_problem, u_field, lambda_field, rho_field, rho_phys_field = form_fem(fem, opt)
     density_filter = DensityFilter(comm, rho_field, rho_phys_field,
                                    opt["filter_radius"], fem["petsc_options"])
+
     heaviside = Heaviside(rho_phys_field)
+
     sens_problem = Sensitivity(comm, opt, linear_problem, u_field, lambda_field, rho_phys_field)
     S_comm = Communicator(rho_phys_field.function_space, fem["mesh_serial"])
+
+
     if rank == 0:  # Changed from comm.rank
         plotter = Plotter(fem["mesh_serial"])
+
+
     num_consts = 1 if opt["opt_compliance"] else 2
     # Get owned DOFs only (not ghosts) for array sizing
     num_elems = rho_field.function_space.dofmap.index_map.size_local
@@ -72,6 +78,7 @@ def topopt(fem, opt):
 
     # Apply passive zones
     centers = rho_field.function_space.tabulate_dof_coordinates()[:num_elems].T
+
     solid, void = opt["solid_zone"](centers), opt["void_zone"](centers)
     rho_ini = np.full(num_elems, opt["vol_frac"])
     rho_ini[solid], rho_ini[void] = 0.995, 0.005
@@ -81,6 +88,7 @@ def topopt(fem, opt):
     rho_min, rho_max = np.zeros(num_elems), np.ones(num_elems)
     rho_min[solid], rho_max[void] = 0.99, 0.01
 
+
     # Start topology optimization
     opt_iter, beta, change = 0, 1, 2*opt["opt_tol"]
     while opt_iter < opt["max_iter"] and change > opt["opt_tol"]:
@@ -88,16 +96,22 @@ def topopt(fem, opt):
         opt_iter += 1
 
         # Density filter and Heaviside projection
+        from fenitop.timing import stats
+        stats.start('filter')
         density_filter.forward()
+
         if opt_iter % opt["beta_interval"] == 0 and beta < opt["beta_max"]:
             beta *= 2
             change = opt["opt_tol"] * 2
         heaviside.forward(beta)
+        stats.stop('filter')
 
         # Solve FEM
+        # (Timing is handled inside solve_fem)
         linear_problem.solve_fem()
 
         # Compute function values and sensitivities
+        stats.start('sensitivity')
         [C_value, V_value, U_value], sensitivities = sens_problem.evaluate()
         heaviside.backward(sensitivities)
         [dCdrho, dVdrho, dUdrho] = density_filter.backward(sensitivities)
@@ -107,8 +121,10 @@ def topopt(fem, opt):
         else:
             g_vec = np.array([V_value-opt["vol_frac"], C_value-opt["compliance_bound"]])
             dJdrho, dgdrho = dUdrho, np.vstack([dVdrho, dCdrho])
+        stats.stop('sensitivity')
 
         # Update the design variables (use only owned DOFs, not ghosts)
+        stats.start('update')
         owned_size = rho_field.function_space.dofmap.index_map.size_local
         rho_values = rho_field.x.petsc_vec.array[:owned_size].copy()
         if opt["opt_compliance"] and opt["use_oc"]:
@@ -132,6 +148,7 @@ def topopt(fem, opt):
         rho_field.x.array[:owned_size] = rho_new
         # Synchronize ghost DOFs across processes (critical for parallel correctness!)
         rho_field.x.scatter_forward()
+        stats.stop('update')
 
         # Output the histories
         opt_time = time.perf_counter() - opt_start_time

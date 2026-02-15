@@ -36,24 +36,27 @@ def create_mechanism_vectors(func_space, in_spring, out_spring):
     block_size = func_space.dofmap.index_map_bs
     spring_vec_wrap = la.vector(index_map, block_size)
     l_vec_wrap = la.vector(index_map, block_size)
+    
+    # Get PETSc vectors for MPI-safe setValues operations
+    spring_vec = spring_vec_wrap.petsc_vec
+    l_vec = l_vec_wrap.petsc_vec
 
     local_range = index_map.local_range
     local_indices = np.arange(local_range[0], local_range[1]).astype(np.int32)
-    # Get number of local nodes (DOFs for the space divided by block size)
     num_local_nodes = index_map.size_local
     local_nodes = func_space.tabulate_dof_coordinates()[:num_local_nodes]
 
     for n, (locator, direction, value) in enumerate([in_spring, out_spring]):
-        # locator expects coordinates as (ndim, npoints)
         ctrl_nodes = local_indices[locator(local_nodes.T)]
         offset = ["x", "y", "z"].index(direction)
         ctrl_dofs = ctrl_nodes*block_size + offset
-        spring_vec_wrap.array[ctrl_dofs] = value
+        # Use PETSc setValues for MPI-safe global index handling
+        spring_vec.setValues(ctrl_dofs, [value,]*ctrl_dofs.size)
         if n == 1:
-            l_vec_wrap.array[ctrl_dofs] = 1.0
-
-    spring_vec_wrap.scatter_reverse(la.InsertMode.add)
-    l_vec_wrap.scatter_reverse(la.InsertMode.add)
+            l_vec.setValues(ctrl_dofs, [1.0,]*ctrl_dofs.size)
+    
+    spring_vec.assemble()
+    l_vec.assemble()
     return spring_vec_wrap, l_vec_wrap
 
 
@@ -97,18 +100,24 @@ class LinearProblem:
 
     def solve_fem(self):
         """Solve K*x=F for FEM."""
+        from fenitop.timing import stats
+        
+        stats.start('assembly')
         self.lhs_mat.zeroEntries()
         assemble_matrix(self.lhs_mat, self.lhs_form, bcs=self.bcs)
         self.lhs_mat.assemble()
         if self.spring_vec_wrap is not None:
-            diag = self.lhs_mat.getDiagonal()
-            diag_array = diag.getArray()
-            spring_array = self.spring_vec_wrap.array
-            diag_array[:] += spring_array
-            diag.setArray(diag_array)
-            self.lhs_mat.setDiagonal(diag)
-            diag.destroy()
+            # Use PETSc vector directly - it handles owned DOFs correctly
+            self.lhs_mat.setDiagonal(self.lhs_mat.getDiagonal() + self.spring_vec)
+        stats.stop('assembly')
+        
+        # The rhs_vec is already assembled in __init__
+        set_bc(self.rhs_vec, self.bcs)
+        
+        stats.start('solve')
         self.solver.solve(self.rhs_vec, self.u_wrap)
+        stats.stop('solve')
+        
         self.u.x.scatter_forward()
 
     def solve_adjoint(self):
@@ -213,13 +222,13 @@ def compare_matrices(array1, array2, precision=12, k=1):
 class Plotter():
     def __init__(self, mesh):
         """Initialize a plotter."""
-        pyvista.OFF_SCREEN = True
-        pyvista.start_xvfb()
+        import pyvista
         self.dim = mesh.topology.dim
         elements, cell_types, nodes = dolfinx.plot.vtk_mesh(mesh, self.dim)
         self.grid = pyvista.UnstructuredGrid(elements, cell_types, nodes)
 
     def plot(self, density, threshold=0.49, smooth_iter=100, path="", filename="optimized_design"):
+        import pyvista
         self.grid.point_data["density"] = np.hstack(density)
         if self.dim == 2:
             grid = self.grid
@@ -232,14 +241,14 @@ class Plotter():
                 adaptive_threshold = max(0.01, max_density * 0.8)
                 print(f"   Adapting threshold: {threshold:.2f} → {adaptive_threshold:.2f} (max density: {max_density:.3f})")
                 threshold = adaptive_threshold
-            grid = self.grid.threshold(threshold).extract_surface()
+            grid = self.grid.threshold(threshold).extract_surface(algorithm='dataset_surface')
         empty_mesh = (self.dim == 3 and grid.n_faces_strict == 0)
 
         if not empty_mesh:
             if self.dim == 3:
                 grid = grid.smooth(n_iter=smooth_iter)
                 grid.point_data["density"] = 0.4
-            plotter = pyvista.Plotter()
+            plotter = pyvista.Plotter(off_screen=True)
             plotter.background_color = "white"
             lighting = self.dim == 3
             plotter.add_mesh(grid, clim=[0, 1], cmap="Greys", lighting=lighting,

@@ -30,17 +30,21 @@ from fenitop.utility import LinearProblem
 
 def form_fem(fem, opt):
     """Form an FEA problem."""
+
+
     # Function spaces and functions
     mesh = fem["mesh"]
     dim = mesh.geometry.dim
     V = functionspace(mesh, ("CG", 1, (dim,)))  # Vector function space
     S0 = functionspace(mesh, ("DG", 0))         # Scalar DG space
     S = functionspace(mesh, ("CG", 1))          # Scalar CG space
+
     u, v = ufl.TrialFunction(V), ufl.TestFunction(V)
     u_field = Function(V)  # Displacement field
     lambda_field = Function(V)  # Adjoint variable field
     rho_field = Function(S0)  # Density field
     rho_phys_field = Function(S)  # Physical density field
+
 
     # Material interpolation
     E0, nu = fem["young's modulus"], fem["poisson's ratio"]
@@ -62,8 +66,11 @@ def form_fem(fem, opt):
     bc = dirichletbc(Constant(mesh, np.full(dim, 0.0)),
                      locate_dofs_topological(V, fdim, disp_facets), V)
 
+
+
     tractions, facets, markers = [], [], []
     for marker, (traction, traction_bc) in enumerate(fem["traction_bcs"]):
+
         tractions.append(Constant(mesh, np.array(traction, dtype=float)))
         current_facets = locate_entities_boundary(mesh, fdim, traction_bc)
         facets.extend(current_facets)
@@ -74,6 +81,8 @@ def form_fem(fem, opt):
     facets, markers = facets[unique_indices], markers[unique_indices]
     sorted_indices = np.argsort(facets)
     facet_tags = meshtags(mesh, fdim, facets[sorted_indices], markers[sorted_indices])
+
+
 
     metadata = {"quadrature_degree": fem["quadrature_degree"]}
     dx = ufl.Measure("dx", metadata=metadata)
@@ -90,8 +99,10 @@ def form_fem(fem, opt):
     else:
         spring_vec, opt["l_vec"] = create_mechanism_vectors(
             V, opt["in_spring"], opt["out_spring"])
+    
     linear_problem = LinearProblem(u_field, lambda_field, lhs, rhs, opt["l_vec"],
                                    spring_vec, [bc], fem["petsc_options"])
+
 
     # Define optimization-related variables
     opt["f_int"] = ufl.inner(sigma(u_field), epsilon(v))*dx
