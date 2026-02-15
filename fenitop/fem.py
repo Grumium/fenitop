@@ -101,7 +101,8 @@ def form_fem(fem, opt):
             V, opt["in_spring"], opt["out_spring"])
     
     linear_problem = LinearProblem(u_field, lambda_field, lhs, rhs, opt["l_vec"],
-                                   spring_vec, [bc], fem["petsc_options"])
+                                   spring_vec, [bc], fem["petsc_options"],
+                                   gpu_accel=fem.get("gpu_accel", False))
 
 
     # Define optimization-related variables

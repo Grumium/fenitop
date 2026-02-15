@@ -61,7 +61,7 @@ def create_mechanism_vectors(func_space, in_spring, out_spring):
 
 
 class LinearProblem:
-    def __init__(self, u, lam, lhs, rhs, l_vec, spring_vec, bcs=[], petsc_options={}):
+    def __init__(self, u, lam, lhs, rhs, l_vec, spring_vec, bcs=[], petsc_options={}, gpu_accel=False):
         """Initialize a linear problem."""
         # Initialization
         self.u, self.lam = u, lam
@@ -89,10 +89,36 @@ class LinearProblem:
             opts[key] = value
         opts.prefixPop()
         self.solver.setFromOptions()
-        for var in [self.lhs_mat, self.rhs_vec, self.l_vec]:
-            if var is not None:
-                var.setOptionsPrefix(prefix)
-                var.setFromOptions()
+        # Only apply options to the matrix (not vectors — GPU types break ghost vectors)
+        self.lhs_mat.setOptionsPrefix(prefix)
+        self.lhs_mat.setFromOptions()
+
+        # GPU acceleration (opt-in via --gpu flag)
+        self.use_gpu = False
+        self._gpu_active = False
+        self._gpu_diag = None
+        self._gpu_mat_obj = None
+        if gpu_accel:
+            try:
+                # Test if HIP sparse matrices are supported
+                test_mat = PETSc.Mat().create(self.u.function_space.mesh.comm)
+                test_mat.setType("aijhipsparse")
+                test_mat.setSizes([10, 10])
+                test_mat.setUp()
+                test_mat.assemble()
+                test_mat.destroy()
+                self.use_gpu = True
+                # Override PC: GAMG/Hypre/SOR are all incompatible with aijhipsparse
+                # Jacobi (diagonal scaling) is the only working preconditioner
+                pc = self.solver.getPC()
+                pc.setType("jacobi")
+                self.solver.setTolerances(max_it=5000)
+                if self.u.function_space.mesh.comm.rank == 0:
+                    print("  🚀 HIP GPU acceleration enabled (PC: Jacobi)")
+            except Exception as e:
+                if self.u.function_space.mesh.comm.rank == 0:
+                    print(f"  ⚠️  GPU requested but HIP not available, falling back to CPU")
+                    print(f"      Reason: {type(e).__name__}: {e}")
 
         assemble_vector(self.rhs_vec, self.rhs_form)
         self.rhs_vec.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
@@ -103,26 +129,128 @@ class LinearProblem:
         from fenitop.timing import stats
         
         stats.start('assembly')
+        # Restore CPU type for assembly (if GPU mode changed it last iteration)
+        if self.use_gpu and self._gpu_active:
+            self.lhs_mat.setType("aij")
         self.lhs_mat.zeroEntries()
         assemble_matrix(self.lhs_mat, self.lhs_form, bcs=self.bcs)
         self.lhs_mat.assemble()
         if self.spring_vec_wrap is not None:
-            # Use PETSc vector directly - it handles owned DOFs correctly
             self.lhs_mat.setDiagonal(self.lhs_mat.getDiagonal() + self.spring_vec)
+        
+        if self.use_gpu:
+            comm = self.u.function_space.mesh.comm
+            # Get diagonal for Jacobi BEFORE switching to GPU type
+            self._gpu_diag = self.lhs_mat.getDiagonal()
+            
+            if self._gpu_mat_obj is None:
+                self._gpu_mat_obj = self.lhs_mat.convert("aijhipsparse")
+            else:
+                self.lhs_mat.copy(self._gpu_mat_obj, structure=PETSc.Mat.Structure.SAME_NONZERO_PATTERN)
+            
+            self._gpu_mat_obj.assemble()
+            self._gpu_active = True
         stats.stop('assembly')
         
         # The rhs_vec is already assembled in __init__
         set_bc(self.rhs_vec, self.bcs)
         
         stats.start('solve')
-        self.solver.solve(self.rhs_vec, self.u_wrap)
+        if self.use_gpu:
+            self._solve_cg_gpu(self.rhs_vec, self.u_wrap)
+        else:
+            self.solver.solve(self.rhs_vec, self.u_wrap)
         stats.stop('solve')
         
         self.u.x.scatter_forward()
+    
+    def _solve_cg_gpu(self, b, x, rtol=1e-8, max_it=5000):
+        """Manual PCG: GPU SpMV (explicit p_gpu sync) + CPU Jacobi."""
+        comm = self.u.function_space.mesh.comm
+        # Jacobi preconditioner from pre-extracted diagonal
+        diag_arr = self._gpu_diag.getArray().copy()
+        diag_arr[np.abs(diag_arr) < 1e-30] = 1.0
+        inv_diag = 1.0 / diag_arr
+        
+        b_norm = b.norm()
+        if b_norm == 0.0:
+            b_norm = 1.0
+        
+        # GPU workspace vectors (compatible with _gpu_mat_obj type)
+        p_gpu = self._gpu_mat_obj.createVecRight()
+        Ax_gpu = self._gpu_mat_obj.createVecLeft()
+        # CPU scratch vector (standard type)
+        Ax = b.duplicate()
+        
+        # Initial residual calculation: r = b - A*x
+        if x.norm() > 1e-15:
+            # Explicitly sync to GPU for mult (safer than relying on PETSc auto-sync)
+            x.copy(p_gpu)
+            self._gpu_mat_obj.mult(p_gpu, Ax_gpu)
+            Ax_gpu.copy(Ax)
+            r = b.copy()
+            r.axpy(-1.0, Ax)
+        else:
+            r = b.copy()
+        
+        # z = M^{-1} * r (on CPU)
+        z = r.duplicate()
+        z.getArray()[:] = r.getArray() * inv_diag
+        
+        p = z.copy()
+        rz = r.dot(z)
+        
+        for it in range(max_it):
+            r_norm = r.norm()
+            if comm.rank == 0 and it % 1000 == 0 and it > 0:
+                print(f"  🔍 CG iter {it:4d}: r_norm/b_norm={r_norm/b_norm:.4e}")
+            
+            if r_norm / b_norm < rtol or it == max_it - 1:
+                if comm.rank == 0 and it > 50: # Only print if not trivial solve
+                    print(f"  🔍 CG {'Converged' if r_norm/b_norm < rtol else 'Reached Max It'} at iter {it}: r_norm/b_norm={r_norm/b_norm:.4e}")
+                break
+            
+            # Ap = A * p
+            p.copy(p_gpu) # CPU -> GPU
+            self._gpu_mat_obj.mult(p_gpu, Ax_gpu)
+            Ax_gpu.copy(Ax) # GPU -> CPU
+            
+            pAp = p.dot(Ax)
+            if abs(pAp) < 1e-30:
+                if comm.rank == 0:
+                    print(f"  🔍 CG Breakdown at iter {it}: pAp={pAp:.4e}")
+                break
+            alpha = rz / pAp
+            
+            x.axpy(alpha, p)
+            r.axpy(-alpha, Ax)
+            
+            # z = M^{-1} * r
+            z.getArray()[:] = r.getArray() * inv_diag
+            
+            pAp_old = rz
+            rz = r.dot(z)
+            beta = rz / pAp_old
+            p.aypx(beta, z)
+        
+        p_gpu.destroy()
+        Ax_gpu.destroy()
+        Ax.destroy()
+        r.destroy()
+        z.destroy()
+        p.destroy()
 
     def solve_adjoint(self):
         """Solve K*lambda=-L for the adjoint equation."""
-        self.solver.solve(-self.l_vec, self.lam_wrap)
+        from fenitop.timing import stats
+        stats.start('solve')
+        rhs = -self.l_vec
+        if self.use_gpu:
+            self._solve_cg_gpu(rhs, self.lam_wrap)
+        else:
+            self.solver.solve(rhs, self.lam_wrap)
+        rhs.destroy()
+        stats.stop('solve')
         self.lam.x.scatter_forward()
 
     def __del__(self):
@@ -131,6 +259,10 @@ class LinearProblem:
         self.rhs_vec.destroy()
         self.u_wrap.destroy()
         self.lam_wrap.destroy()
+        if self._gpu_diag is not None:
+            self._gpu_diag.destroy()
+        if self._gpu_mat_obj is not None:
+            self._gpu_mat_obj.destroy()
         if self.spring_vec_wrap is not None:
             self.spring_vec.destroy()
             self.l_vec.destroy()
