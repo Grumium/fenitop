@@ -20,16 +20,18 @@ Reference:
 
 import numpy as np
 from mpi4py import MPI
-from dolfinx.mesh import create_box, CellType
+from dolfinx.mesh import create_box, CellType, GhostMode
 
 from fenitop.topopt import topopt
 
 
 mesh = create_box(MPI.COMM_WORLD, [[0, 0, 0], [10, 30, 10]],
-                  [75, 225, 75], CellType.hexahedron)
+                  [75, 225, 75], CellType.hexahedron,
+                  ghost_mode=GhostMode.shared_facet)
 if MPI.COMM_WORLD.rank == 0:
     mesh_serial = create_box(MPI.COMM_SELF, [[0, 0, 0], [10, 30, 10]],
-                             [75, 225, 75], CellType.hexahedron)
+                             [75, 225, 75], CellType.hexahedron,
+                             ghost_mode=GhostMode.shared_facet)
 else:
     mesh_serial = None
 
@@ -41,12 +43,12 @@ fem = {  # FEA parameters
     "disp_bc": lambda x: np.isclose(x[1], 0) & (np.less(x[0], 1.5) | np.greater(x[0], 8.5)),
     "traction_bcs": [[(0, 0, -2.0),
                      lambda x: np.isclose(x[1], 30) & (
-                         np.greater(x[0], 4.5) & np.less(x[0], 5.5)
-                         & np.greater(x[2], 4.5) & np.less(x[2], 5.5))]],
+                         (x[0] >= 4.5) & (x[0] <= 5.5)  # Inclusive bounds - works with all mesh resolutions
+                         & (x[2] >= 4.5) & (x[2] <= 5.5))]],
     "body_force": (0, 0, 0),
     "quadrature_degree": 2,
     "petsc_options": {
-        "ksp_type": "cg",
+        "ksp_type": "gmres",  # GMRES solver as specified in paper Fig. 6
         "pc_type": "gamg",
     },
 }

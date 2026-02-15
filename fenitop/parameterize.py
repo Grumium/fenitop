@@ -35,9 +35,9 @@ class DensityFilter():
         v, self.af = ufl.TestFunction(S), Function(S)
 
         self.rho, self.rho_tilde = rho, rho_tilde
-        self.rho_tilde_wrap = la.create_petsc_vector_wrap(self.rho_tilde.x)
-        self.af_wrap = la.create_petsc_vector_wrap(self.af.x)
-        self.vec_s0, self.vec_s = rho.vector.copy(), rho_tilde.vector.copy()
+        self.rho_tilde_wrap = self.rho_tilde.x.petsc_vec
+        self.af_wrap = self.af.x.petsc_vec
+        self.vec_s0, self.vec_s = rho.x.petsc_vec.copy(), rho_tilde.x.petsc_vec.copy()
 
         # Construct Kf and T matrices based on the Helmholtz PDE
         dx = ufl.Measure("dx", metadata={"quadrature_degree": 2})
@@ -72,7 +72,7 @@ class DensityFilter():
 
     def forward(self):
         """Compute the filtered variables."""
-        self.T_mat.mult(self.rho.vector, self.vec_s)
+        self.T_mat.mult(self.rho.x.petsc_vec, self.vec_s)
         self.solver.solve(self.vec_s, self.rho_tilde_wrap)
         self.rho_tilde.x.scatter_forward()
         return self.rho_tilde
@@ -80,12 +80,15 @@ class DensityFilter():
     def backward(self, sf_vectors):
         """Recover the sensitivities."""
         values = []
+        # Get owned DOF size for S0 space (DG space)
+        owned_size = self.rho.function_space.dofmap.index_map.size_local
         for sf in sf_vectors:
             if sf is not None:
                 self.solver.solve(sf, self.af_wrap)
                 self.af.x.scatter_forward()
-                self.T_mat_transpose.mult(self.af.vector, self.vec_s0)
-                values.append(self.vec_s0.array.copy())
+                self.T_mat_transpose.mult(self.af.x.petsc_vec, self.vec_s0)
+                # Return only owned DOFs (not ghosts) to match rho_field size
+                values.append(self.vec_s0.array[:owned_size].copy())
             else:
                 values.append(None)
         return values
@@ -97,9 +100,11 @@ class Heaviside():
 
     def forward(self, beta, eta=0.5):
         denominator = np.tanh(beta*eta) + np.tanh(beta*(1-eta))
-        self.drho = beta*(1-np.tanh(beta*(self.rho_phys.vector-eta))**2) / denominator
-        self.rho_phys.vector.array = (
-            np.tanh(beta*eta)+np.tanh(beta*(self.rho_phys.vector-eta))) / denominator
+        # Use only owned DOFs (not ghosts) for drho to match sensitivity vector sizes
+        owned_size = self.rho_phys.function_space.dofmap.index_map.size_local
+        self.drho = beta*(1-np.tanh(beta*(self.rho_phys.x.array[:owned_size]-eta))**2) / denominator
+        self.rho_phys.x.array[:] = (
+            np.tanh(beta*eta)+np.tanh(beta*(self.rho_phys.x.array-eta))) / denominator
         self.rho_phys.x.scatter_forward()
 
     def backward(self, vectors):

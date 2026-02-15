@@ -28,16 +28,23 @@ def optimality_criteria(rho, rho_min, rho_max, V, dCdrho, dVdrho, move=0.05):
     """Solution update scheme with optimality criteria (OC)."""
     lb, ub = 0.0, 1e6
     comm = MPI.COMM_WORLD
+
     while ub-lb > 1e-4:
         mid = (lb+ub) / 2.0
+        # Ensure the argument to sqrt is always positive to avoid NaN
+        sqrt_arg = np.maximum(-dCdrho / (dVdrho + 1e-12) / mid, 1e-12)
         rho_new = np.maximum.reduce([np.minimum.reduce(
-            [rho*(-dCdrho/(dVdrho+1e-12)/mid)**0.5, rho+move, rho_max]), rho-move, rho_min])
+            [rho * sqrt_arg**0.5, rho+move, rho_max]), rho-move, rho_min])
+        # Use standard MPI sum for speed (non-deterministic but faster)
         dV = comm.allreduce(dVdrho@(rho_new-rho), op=MPI.SUM)
         if V + dV > 0:
             lb = mid
         else:
             ub = mid
+
+    # Use standard MPI max for speed (non-deterministic but faster)
     change = comm.allreduce(np.max(np.abs(rho_new-rho), initial=0), op=MPI.MAX)
+
     return rho_new, change
 
 
