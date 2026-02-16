@@ -172,8 +172,13 @@ def topopt(fem, opt):
             print(f"   Density shape: {values.shape if hasattr(values, 'shape') else len(values)}")
             print(f"   Density range: [{np.min(values):.3f}, {np.max(values):.3f}]")
             filename = opt.get("filename", "optimized_design")
-            plotter.plot(values, filename=filename)
-            print(f"✅ JPG visualization created: {filename}.jpg")
+            threshold = opt.get("plot_threshold", 0.49)
+            upsampling_factor = opt.get("upsampling_factor", 2)
+            iso_smooth = opt.get("iso_smooth", 0.0)
+            # JPG output disabled per user request
+            # plotter.plot(values, threshold=threshold, upsampling_factor=upsampling_factor, iso_smooth=iso_smooth, filename=filename)
+            # print(f"✅ JPG visualization created: {filename}.jpg")
+            print(f"✅ Optimization finished. Results ready in GUI.")
         except Exception as e:
             print(f"⚠️  Warning: Failed to create JPG visualization: {e}")
             import traceback
@@ -184,3 +189,5 @@ def topopt(fem, opt):
         rho_serial = dolfinx.fem.Function(V_serial)
         rho_serial.x.array[:] = values
         save_xdmf(fem["mesh_serial"], rho_serial, filename=filename)
+    
+    return values if rank == 0 else None

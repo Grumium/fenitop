@@ -351,46 +351,144 @@ def compare_matrices(array1, array2, precision=12, k=1):
     return kd_tree.query(array2.round(precision), k=k)[1]
 
 
+def get_2d_refinement(base_grid, density, upsampling_factor=1, iso_smooth=0.0):
+    """
+    Helper to generate a refined 2D ImageData grid from an UnstructuredGrid.
+    Used for high-quality ISO-contouring and density visualization.
+    """
+    import pyvista
+    import numpy as np
+    
+    # Ensure density is on the grid
+    base_grid.point_data["density"] = np.hstack(density)
+    
+    try:
+        # 1. Get bounds and calculate a dense resolution relative to mesh nodes
+        b = base_grid.bounds
+        width, height = b[1] - b[0], b[3] - b[2]
+        
+        # Estimate base resolution from node count
+        n_points = base_grid.n_points
+        if n_points == 0: return base_grid
+        
+        aspect = width / height if height > 0 else 1.0
+        
+        # Approximate number of nodes along each axis
+        n_base_x = np.sqrt(n_points * aspect)
+        n_base_y = np.sqrt(n_points / aspect)
+        
+        # Apply upsampling factor
+        nx = int(n_base_x * upsampling_factor)
+        ny = int(n_base_y * upsampling_factor)
+        nx, ny = max(nx, 20), max(ny, 20)
+        
+        # 2. Create the dense grid
+        refined_grid = pyvista.ImageData(
+            dimensions=(nx, ny, 1),
+            spacing=(width/(nx-1), height/(ny-1), 0),
+            origin=(b[0], b[2], 0)
+        )
+        
+        # 3. Interpolate nodal densities from base mesh onto the dense grid
+        refined_grid = refined_grid.sample(base_grid)
+        
+        # 4. OPTIONAL: Apply Gaussian Smoothing
+        if iso_smooth > 0:
+            scaled_smooth = iso_smooth * upsampling_factor
+            refined_grid = refined_grid.gaussian_smooth(std_dev=scaled_smooth, scalars="density")
+            
+        return refined_grid
+        
+    except Exception as e:
+        print(f"   ⚠️  Warning: Visual refinement failed ({e}), falling back to base mesh.")
+        return base_grid
+
+
 class Plotter():
     def __init__(self, mesh):
         """Initialize a plotter."""
         import pyvista
         self.dim = mesh.topology.dim
         elements, cell_types, nodes = dolfinx.plot.vtk_mesh(mesh, self.dim)
+        
+        # Map Lagrange types to standard linear types for better visualization
+        # 70 (Lagrange Quad) -> 9 (Quad)
+        # 72 (Lagrange Hex) -> 12 (Hex)
+        cell_types[cell_types == 70] = 9
+        cell_types[cell_types == 72] = 12
+        
         self.grid = pyvista.UnstructuredGrid(elements, cell_types, nodes)
 
-    def plot(self, density, threshold=0.49, smooth_iter=100, path="", filename="optimized_design"):
+
+    def plot(self, density, threshold=0.5, upsampling_factor=2, iso_smooth=0.0, smooth_iter=100, path="", filename="optimized_design"):
         import pyvista
         self.grid.point_data["density"] = np.hstack(density)
+        
+        # Determine whether to use cell-based (discrete) or nodal-based (smooth iso-contour)
+        # 2D: Use nodal thresholding for "sub-element resolution" (User request for ISO lines)
+        # 3D: Use nodal thresholding for smooth iso-surface
+        
         if self.dim == 2:
-            grid = self.grid
+            # Visual Refinement: Sample onto a high-resolution uniform grid
+            # Resolution is now adaptive to mesh node density (User Request)
+            
+            # Use helper function for consistent refinement logic
+            refined_grid = get_2d_refinement(self.grid, density, upsampling_factor, iso_smooth)
+            
+            try:
+                # Use the refined grid for thresholding and contouring
+                grid = refined_grid.threshold(threshold, scalars="density")
+                grid_for_contour = refined_grid
+            except Exception as e:
+                print(f"   ⚠️  Warning: Thresholding failed ({e}), falling back to base mesh.")
+                self.grid.point_data["density"] = np.hstack(density)
+                grid = self.grid.threshold(threshold, scalars="density")
+                grid_for_contour = self.grid
         else:
-            # Adapt threshold if all densities are below the default threshold
-            density_array = np.hstack(density)
+            # 3D Logic
+            grid_cells = self.grid.point_data_to_cell_data()
+            density_array = grid_cells.cell_data["density"]
             max_density = np.max(density_array)
             if max_density < threshold:
-                # Use a threshold slightly below the maximum density
                 adaptive_threshold = max(0.01, max_density * 0.8)
                 print(f"   Adapting threshold: {threshold:.2f} → {adaptive_threshold:.2f} (max density: {max_density:.3f})")
                 threshold = adaptive_threshold
-            grid = self.grid.threshold(threshold).extract_surface(algorithm='dataset_surface')
-        empty_mesh = (self.dim == 3 and grid.n_faces_strict == 0)
+            
+            grid = self.grid.threshold(threshold, scalars="density")
+            
+        empty_mesh = (self.dim == 3 and grid.n_faces == 0)
 
         if not empty_mesh:
-            if self.dim == 3:
-                grid = grid.smooth(n_iter=smooth_iter)
-                grid.point_data["density"] = 0.4
             plotter = pyvista.Plotter(off_screen=True)
             plotter.background_color = "white"
             lighting = self.dim == 3
-            plotter.add_mesh(grid, clim=[0, 1], cmap="Greys", lighting=lighting,
-                             show_scalar_bar=False)
+            
             if self.dim == 2:
+                # 1. Plot the actual density field (grayscale) to show material distribution
+                # Use the original grid for the "mushy" background
+                #plotter.add_mesh(self.grid, clim=[0, 1], cmap="Greys", show_edges=True, edge_color="lightgray", line_width=0.5)
+                
+                # 2. Explicitly plot the RED ISO-line (the boundary) for sub-element resolution
+                try:
+                    # Using the refined grid (high-res virtual grid) for the smooth red line
+                    iso_line = grid_for_contour.contour(isosurfaces=[threshold], scalars="density")
+                    plotter.add_mesh(iso_line, color="red", line_width=3, label=f"ISO {threshold:.2f}")
+                except:
+                    pass # Contour might fail if data is too uniform
+                
                 plotter.view_xy()
+            else:
+                # 3D Visualization
+                if self.dim == 3:
+                    grid = grid.smooth(n_iter=smooth_iter)
+                    grid.point_data["density"] = 0.4
+                
+                plotter.add_mesh(grid, clim=[0, 1], cmap="Greys", lighting=lighting,
+                                 show_scalar_bar=False, show_edges=False, edge_color="lightgray", line_width=0.5)
             
             # Construct file path safely
             save_path = os.path.join(path, f"{filename}.jpg")
-            plotter.screenshot(save_path, window_size=(1000, 1000))
+            plotter.screenshot(save_path, window_size=(2000, 2000)) # Increased resolution
             plotter.close()
         else:
             print(f"   ⚠️  Warning: Mesh is empty after thresholding (threshold={threshold:.2f}). No JPG created.")
