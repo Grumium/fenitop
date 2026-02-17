@@ -62,7 +62,8 @@ def topopt(fem, opt):
     heaviside = Heaviside(rho_phys_field)
 
     sens_problem = Sensitivity(comm, opt, linear_problem, u_field, lambda_field, rho_phys_field)
-    S_comm = Communicator(rho_phys_field.function_space, fem["mesh_serial"])
+    S_comm = Communicator(rho_field.function_space, fem["mesh_serial"])
+    S_comm_phys = Communicator(rho_phys_field.function_space, fem["mesh_serial"])
 
 
     if rank == 0:  # Changed from comm.rank
@@ -80,9 +81,24 @@ def topopt(fem, opt):
     centers = rho_field.function_space.tabulate_dof_coordinates()[:num_elems].T
 
     solid, void = opt["solid_zone"](centers), opt["void_zone"](centers)
-    rho_ini = np.full(num_elems, opt["vol_frac"])
-    rho_ini[solid], rho_ini[void] = 0.995, 0.005
-    rho_field.x.petsc_vec.array[:num_elems] = rho_ini
+    if "initial_density" in opt and opt["initial_density"] is not None:
+        initial_rho = opt["initial_density"]
+        if len(initial_rho) == num_elems:
+            if rank == 0:
+                 print("   ✅ Resuming optimization from previous state.")
+            rho_ini = initial_rho
+            rho_ini[solid], rho_ini[void] = 0.995, 0.005
+            rho_field.x.petsc_vec.array[:num_elems] = rho_ini
+        else:
+            if rank == 0:
+                 print(f"   ⚠️  Resume failed: Data size mismatch (Expected {num_elems}, Got {len(initial_rho)}). Starting fresh.")
+            rho_ini = np.full(num_elems, opt["vol_frac"])
+            rho_ini[solid], rho_ini[void] = 0.995, 0.005
+            rho_field.x.petsc_vec.array[:num_elems] = rho_ini
+    else:
+        rho_ini = np.full(num_elems, opt["vol_frac"])
+        rho_ini[solid], rho_ini[void] = 0.995, 0.005
+        rho_field.x.petsc_vec.array[:num_elems] = rho_ini
     # Synchronize ghost DOFs across processes after initialization
     rho_field.x.scatter_forward()
     rho_min, rho_max = np.zeros(num_elems), np.ones(num_elems)
@@ -157,7 +173,7 @@ def topopt(fem, opt):
         if rank == 0:  # Changed from comm.rank
             if "progress_callback" in opt and opt["progress_callback"] is not None:
                 try:
-                    should_continue = opt["progress_callback"](opt_iter, C_value, V_value, change, field=rho_phys_field, comm=S_comm)
+                    should_continue = opt["progress_callback"](opt_iter, C_value, V_value, change, field=rho_phys_field, comm=S_comm_phys)
                     if should_continue is False:
                         break
                 except Exception:
@@ -167,29 +183,28 @@ def topopt(fem, opt):
                       f"beta: {beta}, C: {C_value:.3f}, V: {V_value:.3f}, "
                       f"U: {U_value:.3f}, change: {change:.3f}", flush=True)
 
-    values = S_comm.gather(rho_phys_field.x.petsc_vec)
+    design_values = S_comm.gather(rho_field.x.petsc_vec)
+    physical_values = S_comm_phys.gather(rho_phys_field.x.petsc_vec) 
+    
+    final_results = None
     if rank == 0:  # Changed from comm.rank
+        final_results = {
+            "design": design_values,
+            "physical": physical_values
+        }
+        
         try:
-            #print(f"\n📊 Creating JPG visualization...")
-            #print(f"   Density shape: {values.shape if hasattr(values, 'shape') else len(values)}")
-            #print(f"   Density range: [{np.min(values):.3f}, {np.max(values):.3f}]")
             filename = opt.get("filename", "optimized_design")
-            threshold = opt.get("plot_threshold", 0.49)
-            upsampling_factor = opt.get("upsampling_factor", 2)
-            iso_smooth = opt.get("iso_smooth", 0.0)
-            # JPG output disabled per user request
-            # plotter.plot(values, threshold=threshold, upsampling_factor=upsampling_factor, iso_smooth=iso_smooth, filename=filename)
-            # print(f"✅ JPG visualization created: {filename}.jpg")
-            #print(f"✅ Optimization finished. Results ready in GUI.")
+            # Save results on rank 0 only to avoid file locking
+            # Save Physical Density for Visualization compatibility (matches prior behavior)
+            V_serial = dolfinx.fem.functionspace(fem["mesh_serial"], rho_phys_field.function_space.ufl_element())
+            rho_serial = dolfinx.fem.Function(V_serial)
+            rho_serial.x.array[:] = physical_values
+            save_xdmf(fem["mesh_serial"], rho_serial, filename=filename)
         except Exception as e:
-            #print(f"⚠️  Warning: Failed to create JPG visualization: {e}")
+            #print(f"⚠️  Warning: Failed to save xdmf: {e}")
             import traceback
             traceback.print_exc()
 
-        # Save results on rank 0 only to avoid file locking
-        V_serial = dolfinx.fem.functionspace(fem["mesh_serial"], rho_phys_field.function_space.ufl_element())
-        rho_serial = dolfinx.fem.Function(V_serial)
-        rho_serial.x.array[:] = values
-        save_xdmf(fem["mesh_serial"], rho_serial, filename=filename)
     
-    return values if rank == 0 else None
+    return final_results

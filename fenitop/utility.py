@@ -353,55 +353,26 @@ def compare_matrices(array1, array2, precision=12, k=1):
 
 def get_2d_refinement(base_grid, density, upsampling_factor=1, iso_smooth=0.0):
     """
-    Helper to generate a refined 2D ImageData grid from an UnstructuredGrid.
-    Used for high-quality ISO-contouring and density visualization.
+    Helper to apply smoothing to 2D grid scalars (iterative averaging).
+    Replaces previous Image-based resampling based on user request.
     """
     import pyvista
     import numpy as np
     
-    # Ensure density is on the grid
-    base_grid.point_data["density"] = np.hstack(density)
-    
-    try:
-        # 1. Get bounds and calculate a dense resolution relative to mesh nodes
-        b = base_grid.bounds
-        width, height = b[1] - b[0], b[3] - b[2]
+    # Create a copy to modify
+    refined_grid = base_grid.copy(deep=False)
+    refined_grid.point_data["density"] = np.hstack(density)
+
+    if iso_smooth > 0:
+        # Simulate Gaussian smoothing on unstructured grid via iterative averaging
+        # Heuristic: n_iter ~ iso_smooth
+        n_iter = int(max(1, iso_smooth * 10))
         
-        # Estimate base resolution from node count
-        n_points = base_grid.n_points
-        if n_points == 0: return base_grid
-        
-        aspect = width / height if height > 0 else 1.0
-        
-        # Approximate number of nodes along each axis
-        n_base_x = np.sqrt(n_points * aspect)
-        n_base_y = np.sqrt(n_points / aspect)
-        
-        # Apply upsampling factor
-        nx = int(n_base_x * upsampling_factor)
-        ny = int(n_base_y * upsampling_factor)
-        nx, ny = max(nx, 20), max(ny, 20)
-        
-        # 2. Create the dense grid
-        refined_grid = pyvista.ImageData(
-            dimensions=(nx, ny, 1),
-            spacing=(width/(nx-1), height/(ny-1), 0),
-            origin=(b[0], b[2], 0)
-        )
-        
-        # 3. Interpolate nodal densities from base mesh onto the dense grid
-        refined_grid = refined_grid.sample(base_grid)
-        
-        # 4. OPTIONAL: Apply Gaussian Smoothing
-        if iso_smooth > 0:
-            scaled_smooth = iso_smooth * upsampling_factor
-            refined_grid = refined_grid.gaussian_smooth(std_dev=scaled_smooth, scalars="density")
-            
-        return refined_grid
-        
-    except Exception as e:
-        print(f"   ⚠️  Warning: Visual refinement failed ({e}), falling back to base mesh.")
-        return base_grid
+        for _ in range(n_iter):
+             refined_grid = refined_grid.point_data_to_cell_data(pass_point_data=False)
+             refined_grid = refined_grid.cell_data_to_point_data(pass_cell_data=False)
+             
+    return refined_grid
 
 
 
@@ -424,7 +395,27 @@ class Plotter():
 
     def plot(self, density, threshold=0.5, iso_smooth=0.0, smooth_iter=100, path="", filename="optimized_design"):
         import pyvista
-        self.grid.point_data["density"] = np.hstack(density)
+        
+        # Determine if data is Nodal (Point) or Elemental (Cell)
+        n_points = self.grid.n_points
+        n_cells = self.grid.n_cells
+        data_len = len(density)
+        
+        is_cell_data = False
+        if data_len == n_cells:
+            is_cell_data = True
+            self.grid.cell_data["density"] = np.hstack(density)
+            # Remove point data if it exists to avoid confusion
+            if "density" in self.grid.point_data:
+                del self.grid.point_data["density"]
+        elif data_len == n_points:
+            self.grid.point_data["density"] = np.hstack(density)
+            if "density" in self.grid.cell_data:
+                del self.grid.cell_data["density"]
+        else:
+            print(f"⚠️  Plotter Error: Data size {data_len} does not match Points ({n_points}) or Cells ({n_cells})")
+            return
+
         
         # Determine whether to use cell-based (discrete) or nodal-based (smooth iso-contour)
         # 2D: Use nodal thresholding for "sub-element resolution" (User request for ISO lines)
@@ -433,17 +424,33 @@ class Plotter():
         if self.dim == 2:
             # Re-implement optional refinement for smoothing
             if iso_smooth > 0:
-                refined_grid = get_2d_refinement(self.grid, density, upsampling_factor=1, iso_smooth=iso_smooth)
+                # Refinement requires Nodal Data
+                grid_for_refinement = self.grid
+                if is_cell_data:
+                    grid_for_refinement = self.grid.cell_data_to_point_data()
+                
+                refined_grid = get_2d_refinement(grid_for_refinement, 
+                                                 grid_for_refinement.point_data["density"], 
+                                                 upsampling_factor=1, iso_smooth=iso_smooth)
                 grid = refined_grid.threshold(threshold, scalars="density")
                 grid_for_contour = refined_grid
             else:
-                self.grid.point_data["density"] = np.hstack(density)
+                # If cell data, converting to point data usually gives better contours
+                if is_cell_data:
+                     grid_for_contour = self.grid.cell_data_to_point_data()
+                else:
+                     grid_for_contour = self.grid
+                     
                 grid = self.grid.threshold(threshold, scalars="density")
-                grid_for_contour = self.grid
         else:
             # 3D Logic
-            grid_cells = self.grid.point_data_to_cell_data()
-            density_array = grid_cells.cell_data["density"]
+            if is_cell_data:
+                 # If we have cell data, we can use it directly for thresholding volume
+                 density_array = self.grid.cell_data["density"]
+            else:
+                 # If point data, convert to cell for max check? Or just use point data
+                 density_array = self.grid.point_data["density"]
+
             max_density = np.max(density_array)
             if max_density < threshold:
                 adaptive_threshold = max(0.01, max_density * 0.8)
