@@ -157,7 +157,9 @@ def topopt(fem, opt):
         if rank == 0:  # Changed from comm.rank
             if "progress_callback" in opt and opt["progress_callback"] is not None:
                 try:
-                    opt["progress_callback"](opt_iter, C_value, V_value, change)
+                    should_continue = opt["progress_callback"](opt_iter, C_value, V_value, change, field=rho_phys_field, comm=S_comm)
+                    if should_continue is False:
+                        break
                 except Exception:
                     pass  # Silently ignore callback errors
             else:
@@ -168,9 +170,9 @@ def topopt(fem, opt):
     values = S_comm.gather(rho_phys_field.x.petsc_vec)
     if rank == 0:  # Changed from comm.rank
         try:
-            print(f"\n📊 Creating JPG visualization...")
-            print(f"   Density shape: {values.shape if hasattr(values, 'shape') else len(values)}")
-            print(f"   Density range: [{np.min(values):.3f}, {np.max(values):.3f}]")
+            #print(f"\n📊 Creating JPG visualization...")
+            #print(f"   Density shape: {values.shape if hasattr(values, 'shape') else len(values)}")
+            #print(f"   Density range: [{np.min(values):.3f}, {np.max(values):.3f}]")
             filename = opt.get("filename", "optimized_design")
             threshold = opt.get("plot_threshold", 0.49)
             upsampling_factor = opt.get("upsampling_factor", 2)
@@ -178,9 +180,9 @@ def topopt(fem, opt):
             # JPG output disabled per user request
             # plotter.plot(values, threshold=threshold, upsampling_factor=upsampling_factor, iso_smooth=iso_smooth, filename=filename)
             # print(f"✅ JPG visualization created: {filename}.jpg")
-            print(f"✅ Optimization finished. Results ready in GUI.")
+            #print(f"✅ Optimization finished. Results ready in GUI.")
         except Exception as e:
-            print(f"⚠️  Warning: Failed to create JPG visualization: {e}")
+            #print(f"⚠️  Warning: Failed to create JPG visualization: {e}")
             import traceback
             traceback.print_exc()
 

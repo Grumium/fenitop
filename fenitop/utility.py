@@ -404,6 +404,8 @@ def get_2d_refinement(base_grid, density, upsampling_factor=1, iso_smooth=0.0):
         return base_grid
 
 
+
+
 class Plotter():
     def __init__(self, mesh):
         """Initialize a plotter."""
@@ -420,7 +422,7 @@ class Plotter():
         self.grid = pyvista.UnstructuredGrid(elements, cell_types, nodes)
 
 
-    def plot(self, density, threshold=0.5, upsampling_factor=2, iso_smooth=0.0, smooth_iter=100, path="", filename="optimized_design"):
+    def plot(self, density, threshold=0.5, iso_smooth=0.0, smooth_iter=100, path="", filename="optimized_design"):
         import pyvista
         self.grid.point_data["density"] = np.hstack(density)
         
@@ -429,18 +431,12 @@ class Plotter():
         # 3D: Use nodal thresholding for smooth iso-surface
         
         if self.dim == 2:
-            # Visual Refinement: Sample onto a high-resolution uniform grid
-            # Resolution is now adaptive to mesh node density (User Request)
-            
-            # Use helper function for consistent refinement logic
-            refined_grid = get_2d_refinement(self.grid, density, upsampling_factor, iso_smooth)
-            
-            try:
-                # Use the refined grid for thresholding and contouring
+            # Re-implement optional refinement for smoothing
+            if iso_smooth > 0:
+                refined_grid = get_2d_refinement(self.grid, density, upsampling_factor=1, iso_smooth=iso_smooth)
                 grid = refined_grid.threshold(threshold, scalars="density")
                 grid_for_contour = refined_grid
-            except Exception as e:
-                print(f"   ⚠️  Warning: Thresholding failed ({e}), falling back to base mesh.")
+            else:
                 self.grid.point_data["density"] = np.hstack(density)
                 grid = self.grid.threshold(threshold, scalars="density")
                 grid_for_contour = self.grid
@@ -470,7 +466,6 @@ class Plotter():
                 
                 # 2. Explicitly plot the RED ISO-line (the boundary) for sub-element resolution
                 try:
-                    # Using the refined grid (high-res virtual grid) for the smooth red line
                     iso_line = grid_for_contour.contour(isosurfaces=[threshold], scalars="density")
                     plotter.add_mesh(iso_line, color="red", line_width=3, label=f"ISO {threshold:.2f}")
                 except:
