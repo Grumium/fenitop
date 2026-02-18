@@ -112,3 +112,38 @@ def form_fem(fem, opt):
     opt["total_volume"] = Constant(mesh, 1.0)*dx
 
     return linear_problem, u_field, lambda_field, rho_field, rho_phys_field
+
+
+def compute_von_mises(u_field, fem):
+    """
+    Compute Von Mises stress from displacement field.
+    Returns a DG0 function containing the stress values for visualization.
+    """
+    import dolfinx.fem
+    
+    mesh = u_field.function_space.mesh
+    
+    # Material properties (Solid)
+    E = fem["young's modulus"]
+    nu = fem["poisson's ratio"]
+    
+    lambda_ = E * nu / ((1 + nu) * (1 - 2 * nu))
+    mu = E / (2 * (1 + nu))
+    
+    def epsilon(u):
+        return ufl.sym(ufl.grad(u))
+    
+    def sigma(u):
+        return 2.0 * mu * epsilon(u) + lambda_ * ufl.tr(epsilon(u)) * ufl.Identity(len(u))
+    
+    def von_mises(u):
+        s = sigma(u) - (1./3)*ufl.tr(sigma(u))*ufl.Identity(len(u))
+        return ufl.sqrt(1.5 * ufl.inner(s, s))
+    
+    # Create DG0 space for stress (element-wise constant)
+    W = dolfinx.fem.functionspace(mesh, ("DG", 0))
+    stress_expr = dolfinx.fem.Expression(von_mises(u_field), W.element.interpolation_points)
+    stress_field = dolfinx.fem.Function(W)
+    stress_field.interpolate(stress_expr)
+    
+    return stress_field

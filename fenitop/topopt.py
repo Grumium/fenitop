@@ -26,7 +26,7 @@ import numpy as np
 from mpi4py import MPI
 import dolfinx.fem  # Added for rank-0 saving
 
-from fenitop.fem import form_fem
+from fenitop.fem import form_fem, compute_von_mises
 from fenitop.parameterize import DensityFilter, Heaviside
 from fenitop.sensitivity import Sensitivity
 from fenitop.optimize import optimality_criteria, mma_optimizer
@@ -64,6 +64,7 @@ def topopt(fem, opt):
     sens_problem = Sensitivity(comm, opt, linear_problem, u_field, lambda_field, rho_phys_field)
     S_comm = Communicator(rho_field.function_space, fem["mesh_serial"])
     S_comm_phys = Communicator(rho_phys_field.function_space, fem["mesh_serial"])
+    V_comm = Communicator(u_field.function_space, fem["mesh_serial"])
 
 
     if rank == 0:  # Changed from comm.rank
@@ -135,7 +136,7 @@ def topopt(fem, opt):
             g_vec = np.array([V_value-opt["vol_frac"]])
             dJdrho, dgdrho = dCdrho, np.vstack([dVdrho])
         else:
-            g_vec = np.array([V_value-opt["vol_frac"], C_value-opt["compliance_bound"]])
+            g_vec = np.array([V_value-opt["vol_frac"], C_value-opt.get("compliance_bound", 1e9)])
             dJdrho, dgdrho = dUdrho, np.vstack([dVdrho, dCdrho])
         stats.stop('sensitivity')
 
@@ -173,7 +174,11 @@ def topopt(fem, opt):
         if rank == 0:  # Changed from comm.rank
             if "progress_callback" in opt and opt["progress_callback"] is not None:
                 try:
-                    should_continue = opt["progress_callback"](opt_iter, C_value, V_value, change, field=rho_phys_field, comm=S_comm_phys)
+                    should_continue = opt["progress_callback"](
+                        opt_iter, C_value, V_value, change, 
+                        field=rho_phys_field, comm=S_comm_phys,
+                        u_field=u_field, fem=fem, V_comm=V_comm, S_comm=S_comm
+                    )
                     if should_continue is False:
                         break
                 except Exception:
@@ -186,39 +191,61 @@ def topopt(fem, opt):
     design_values = S_comm.gather(rho_field.x.petsc_vec)
     physical_values = S_comm_phys.gather(rho_phys_field.x.petsc_vec) 
     
+    # Calculate Von Mises Stress
+    stress_field = compute_von_mises(u_field, fem)
+    # Communicator for stress (DG0 same as density)
+    stress_values = S_comm.gather(stress_field.x.petsc_vec)
+    
+    # Gather Displacement
+    displacement_values = V_comm.gather(u_field.x.petsc_vec)
+    
     final_results = None
     if rank == 0:  # Changed from comm.rank
         final_results = {
             "design": design_values,
-            "physical": physical_values
+            "physical": physical_values,
+            "displacement": displacement_values,
+            "von_mises": stress_values
         }
         
-        # 1. JPG Visualization
-        try:
-            print(f"\n📊 Creating JPG visualization...")
-            print(f"   Density shape: {physical_values.shape if hasattr(physical_values, 'shape') else len(physical_values)}")
-            print(f"   Density range: [{np.min(physical_values):.3f}, {np.max(physical_values):.3f}]")
-            filename = opt.get("filename", "optimized_design")
-            plotter.plot(physical_values, filename=filename)
-            print(f"✅ JPG visualization created: {filename}.jpg")
-        except Exception as e:
-            print(f"⚠️  Warning: Failed to create JPG visualization: {e}")
-            import traceback
-            traceback.print_exc()
+        # 1. JPG Visualization - conditionally skip if running in GUI
+        # (User request: detect GUI context dynamically via environment variable set by run_gui.py)
+        is_gui_running = os.environ.get("FENITOP_GUI_MODE") == "1"
+        
+        if not is_gui_running:
+            try:
+                print(f"\n📊 Creating JPG visualization...")
+                print(f"   Density shape: {physical_values.shape if hasattr(physical_values, 'shape') else len(physical_values)}")
+                print(f"   Density range: [{np.min(physical_values):.3f}, {np.max(physical_values):.3f}]")
+                filename = opt.get("filename", "optimized_design")
+                plotter.plot(physical_values, filename=filename)
+                print(f"✅ JPG visualization created: {filename}.jpg")
+            except Exception as e:
+                print(f"⚠️  Warning: Failed to create JPG visualization: {e}")
+                import traceback
+                traceback.print_exc()
+        else:
+            if rank == 0:
+                print("   ℹ️  JPG visualization skipped (GUI mode detected).")
 
         # 2. XDMF Saving
-        try:
-            filename = opt.get("filename", "optimized_design")
-            # Save results on rank 0 only to avoid file locking
-            # Save Physical Density for Visualization compatibility (matches prior behavior)
-            V_serial = dolfinx.fem.functionspace(fem["mesh_serial"], rho_phys_field.function_space.ufl_element())
-            rho_serial = dolfinx.fem.Function(V_serial)
-            rho_serial.x.array[:] = physical_values
-            save_xdmf(fem["mesh_serial"], rho_serial, filename=filename)
-        except Exception as e:
-            #print(f"⚠️  Warning: Failed to save xdmf: {e}")
+        if not is_gui_running:
+            try:
+                filename = opt.get("filename", "optimized_design")
+                # Save results on rank 0 only to avoid file locking
+                # Save Physical Density for Visualization compatibility (matches prior behavior)
+                V_serial = dolfinx.fem.functionspace(fem["mesh_serial"], rho_phys_field.function_space.ufl_element())
+                rho_serial = dolfinx.fem.Function(V_serial)
+                rho_serial.x.array[:] = physical_values
+                save_xdmf(fem["mesh_serial"], rho_serial, filename=filename)
+            except Exception as e:
+                print(f"⚠️  Warning: Failed to save XDMF: {e}")
+        else:
+            if rank == 0:
+                print("   ℹ️  XDMF saving skipped (GUI mode detected).")
             import traceback
             traceback.print_exc()
 
     
     return final_results
+
