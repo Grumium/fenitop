@@ -459,7 +459,7 @@ class Plotter():
             
             grid = self.grid.threshold(threshold, scalars="density")
             
-        empty_mesh = (self.dim == 3 and grid.n_faces == 0)
+        empty_mesh = (self.dim == 3 and grid.n_cells == 0)
 
         if not empty_mesh:
             plotter = pyvista.Plotter(off_screen=True)
@@ -468,8 +468,8 @@ class Plotter():
             
             if self.dim == 2:
                 # 1. Plot the actual density field (grayscale) to show material distribution
-                # Use the original grid for the "mushy" background
-                #plotter.add_mesh(self.grid, clim=[0, 1], cmap="Greys", show_edges=True, edge_color="lightgray", line_width=0.5)
+                # Use the original grid for the "mushy" background - Restored to match deprecated behavior
+                plotter.add_mesh(self.grid, clim=[0, 1], cmap="Greys", show_edges=False, show_scalar_bar=False)
                 
                 # 2. Explicitly plot the RED ISO-line (the boundary) for sub-element resolution
                 try:
@@ -482,8 +482,24 @@ class Plotter():
             else:
                 # 3D Visualization
                 if self.dim == 3:
-                    grid = grid.smooth(n_iter=smooth_iter)
-                    grid.point_data["density"] = 0.4
+                     # Grid is UnstructuredGrid. To smooth, we usually extract surface.
+                     # Or we assume grid is already expected to be a volume and just plot it.
+                     # The original code likely intended to smooth the isosurface, but 'grid' here is the thresholded volume.
+                     # PyVista's smooth filter works on PolyData (surfaces).
+                     try:
+                        # Convert to PolyData (surface) if we want to smooth
+                        surface = grid.extract_surface()
+                        smoothed = surface.smooth(n_iter=smooth_iter)
+                        
+                        # Use smoothed surface for plotting
+                        grid = smoothed
+                     except:
+                        pass # Fallback to original grid if smoothing fails
+                     
+                     if "density" in grid.point_data:
+                         grid.point_data["density"] = 0.4
+                     elif "density" in grid.cell_data:
+                         grid.cell_data["density"] = 0.4
                 
                 plotter.add_mesh(grid, clim=[0, 1], cmap="Greys", lighting=lighting,
                                  show_scalar_bar=False, show_edges=False, edge_color="lightgray", line_width=0.5)

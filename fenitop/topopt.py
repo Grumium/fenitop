@@ -193,6 +193,20 @@ def topopt(fem, opt):
             "physical": physical_values
         }
         
+        # 1. JPG Visualization
+        try:
+            print(f"\n📊 Creating JPG visualization...")
+            print(f"   Density shape: {physical_values.shape if hasattr(physical_values, 'shape') else len(physical_values)}")
+            print(f"   Density range: [{np.min(physical_values):.3f}, {np.max(physical_values):.3f}]")
+            filename = opt.get("filename", "optimized_design")
+            plotter.plot(physical_values, filename=filename)
+            print(f"✅ JPG visualization created: {filename}.jpg")
+        except Exception as e:
+            print(f"⚠️  Warning: Failed to create JPG visualization: {e}")
+            import traceback
+            traceback.print_exc()
+
+        # 2. XDMF Saving
         try:
             filename = opt.get("filename", "optimized_design")
             # Save results on rank 0 only to avoid file locking
