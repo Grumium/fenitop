@@ -20,7 +20,6 @@ Reference:
 
 import time
 import os
-import sys
 
 import numpy as np
 from mpi4py import MPI
@@ -82,21 +81,19 @@ def topopt(fem, opt):
     centers = rho_field.function_space.tabulate_dof_coordinates()[:num_elems].T
 
     solid, void = opt["solid_zone"](centers), opt["void_zone"](centers)
-    if "initial_density" in opt and opt["initial_density"] is not None:
-        initial_rho = opt["initial_density"]
+    initial_rho = opt.get("initial_density")
+    if initial_rho is not None:
         if len(initial_rho) == num_elems:
             if rank == 0:
-                 print("   ✅ Resuming optimization from previous state.")
-            rho_ini = initial_rho
+                print("   ✅ Resuming optimization from previous state.")
+            rho_ini = initial_rho.copy()
             rho_ini[solid], rho_ini[void] = 0.995, 0.005
             rho_field.x.petsc_vec.array[:num_elems] = rho_ini
         else:
             if rank == 0:
-                 print(f"   ⚠️  Resume failed: Data size mismatch (Expected {num_elems}, Got {len(initial_rho)}). Starting fresh.")
-            rho_ini = np.full(num_elems, opt["vol_frac"])
-            rho_ini[solid], rho_ini[void] = 0.995, 0.005
-            rho_field.x.petsc_vec.array[:num_elems] = rho_ini
-    else:
+                print(f"   ⚠️  Resume failed: size mismatch (expected {num_elems}, got {len(initial_rho)}). Starting fresh.")
+            initial_rho = None  # fall through to fresh start
+    if initial_rho is None:
         rho_ini = np.full(num_elems, opt["vol_frac"])
         rho_ini[solid], rho_ini[void] = 0.995, 0.005
         rho_field.x.petsc_vec.array[:num_elems] = rho_ini
@@ -105,9 +102,23 @@ def topopt(fem, opt):
     rho_min, rho_max = np.zeros(num_elems), np.ones(num_elems)
     rho_min[solid], rho_max[void] = 0.99, 0.01
 
+    # Restore optimizer state for resume.
+    # opt["beta"] and opt["opt_iter"] carry the saved values for all solver types.
+    # For MMA, additionally restore the two previous iterates and asymptote bounds
+    # so the very first resumed step is numerically identical to a straight run.
+    resume_opt_iter = int(opt.get("opt_iter", 0)) if initial_rho is not None else 0
+    resume_beta     = int(opt.get("beta", 1))      if initial_rho is not None else 1
+
+    if not opt["use_oc"]:
+        ms = opt.get("mma_state") or {}
+        if ms and len(ms.get("rho_old1", [])) == num_elems:
+            rho_old1 = ms["rho_old1"].copy()
+            rho_old2 = ms["rho_old2"].copy()
+            low = ms.get("low")
+            upp = ms.get("upp")
 
     # Start topology optimization
-    opt_iter, beta, change = 0, 1, 2*opt["opt_tol"]
+    opt_iter, beta, change = resume_opt_iter, resume_beta, 2*opt["opt_tol"]
     while opt_iter < opt["max_iter"] and change > opt["opt_tol"]:
         opt_start_time = time.perf_counter()
         opt_iter += 1
@@ -198,14 +209,33 @@ def topopt(fem, opt):
     
     # Gather Displacement
     displacement_values = V_comm.gather(u_field.x.petsc_vec)
-    
+
+    # Save raw local density array for resume.
+    # S_comm.gather() reorders to serial-mesh ordering; saving the raw local array
+    # avoids any permutation issue when assigning back to rho_field on resume.
+    design_raw = rho_field.x.petsc_vec.array[:num_elems].copy()
+
+    # MMA history for resume (rho_old1/2 and asymptote bounds).
+    mma_state = None
+    if not opt["use_oc"]:
+        mma_state = {
+            "rho_old1": rho_old1.copy(),
+            "rho_old2": rho_old2.copy(),
+            "low": low.copy() if low is not None else None,
+            "upp": upp.copy() if upp is not None else None,
+        }
+
     final_results = None
-    if rank == 0:  # Changed from comm.rank
+    if rank == 0:
         final_results = {
             "design": design_values,
+            "design_raw": design_raw,
+            "beta": beta,
+            "opt_iter": opt_iter,
             "physical": physical_values,
             "displacement": displacement_values,
-            "von_mises": stress_values
+            "von_mises": stress_values,
+            "mma_state": mma_state,
         }
         
         # 1. JPG Visualization - conditionally skip if running in GUI
@@ -215,7 +245,6 @@ def topopt(fem, opt):
         if not is_gui_running:
             try:
                 print(f"\n📊 Creating JPG visualization...")
-                print(f"   Density shape: {physical_values.shape if hasattr(physical_values, 'shape') else len(physical_values)}")
                 print(f"   Density range: [{np.min(physical_values):.3f}, {np.max(physical_values):.3f}]")
                 filename = opt.get("filename", "optimized_design")
                 plotter.plot(physical_values, filename=filename)
@@ -225,15 +254,12 @@ def topopt(fem, opt):
                 import traceback
                 traceback.print_exc()
         else:
-            if rank == 0:
-                print("   ℹ️  JPG visualization skipped (GUI mode detected).")
+            print("   ℹ️  JPG visualization skipped (GUI mode detected).")
 
         # 2. XDMF Saving
         if not is_gui_running:
             try:
                 filename = opt.get("filename", "optimized_design")
-                # Save results on rank 0 only to avoid file locking
-                # Save Physical Density for Visualization compatibility (matches prior behavior)
                 V_serial = dolfinx.fem.functionspace(fem["mesh_serial"], rho_phys_field.function_space.ufl_element())
                 rho_serial = dolfinx.fem.Function(V_serial)
                 rho_serial.x.array[:] = physical_values
@@ -241,10 +267,7 @@ def topopt(fem, opt):
             except Exception as e:
                 print(f"⚠️  Warning: Failed to save XDMF: {e}")
         else:
-            if rank == 0:
-                print("   ℹ️  XDMF saving skipped (GUI mode detected).")
-            import traceback
-            traceback.print_exc()
+            print("   ℹ️  XDMF saving skipped (GUI mode detected).")
 
     
     return final_results
