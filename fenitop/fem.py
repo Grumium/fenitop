@@ -69,9 +69,12 @@ def form_fem(fem, opt):
     bcs = [bc]
 
     # Symmetry roller BCs: constrain normal displacement to zero on each
-    # symmetry plane.  Each entry in "symmetry_bcs" is a dict with keys
-    # "locator" (callable), "component" (int), "value" (float, usually 0).
+    # symmetry plane.  Axis-aligned planes use a simple Dirichlet BC on a
+    # single component.  Diagonal planes are handled via dolfinx_mpc slip
+    # constraints (u · n = 0) further below.
     for sym_bc in fem.get("symmetry_bcs", []):
+        if sym_bc.get("type") in ("diagonal", "rotational_c4"):
+            continue  # handled via MPC below
         sym_facets = locate_entities_boundary(mesh, fdim, sym_bc["locator"])
         comp = sym_bc["component"]  # 0=x, 1=y, 2=z
         # Constrain only the single DOF component (sub-space of V)
@@ -83,6 +86,40 @@ def form_fem(fem, opt):
         sym_val.x.array[:] = 0.0
         sym_dirichlet = dirichletbc(sym_val, sym_dofs, V_sub)
         bcs.append(sym_dirichlet)
+
+    # Build dolfinx_mpc MultiPointConstraint for non-axis-aligned symmetry
+    mpc = None
+    diag_sym_bcs = [s for s in fem.get("symmetry_bcs", [])
+                    if s.get("type") == "diagonal"]
+    rot_sym_bcs = [s for s in fem.get("symmetry_bcs", [])
+                   if s.get("type") == "rotational_c4"]
+
+    if rot_sym_bcs:
+        # Rotational C4 (cyclic periodic) takes priority
+        try:
+            from fenitop_gui.adapter.symmetry import build_mpc_cyclic_constraints
+            rot_data = rot_sym_bcs[0].get("rot_sym", rot_sym_bcs[0])
+            mpc = build_mpc_cyclic_constraints(V, mesh, rot_data, bcs)
+            if mpc is not None and mesh.comm.rank == 0:
+                print(f"  🔗 MPC cyclic constraint active (C4 rotational, "
+                      f"{mpc.num_local_slaves} local slave DOFs)")
+        except Exception as e:
+            if mesh.comm.rank == 0:
+                print(f"  ⚠️  Failed to build cyclic MPC: {e}")
+                import traceback; traceback.print_exc()
+            mpc = None
+    elif diag_sym_bcs:
+        try:
+            from fenitop_gui.adapter.symmetry import build_mpc_slip_constraints
+            mpc = build_mpc_slip_constraints(V, mesh, fem["symmetry_bcs"], bcs)
+            if mpc is not None and mesh.comm.rank == 0:
+                print(f"  🔗 MPC slip constraint active "
+                      f"({len(diag_sym_bcs)} diagonal plane(s), "
+                      f"{mpc.num_local_slaves} local slave DOFs)")
+        except Exception as e:
+            if mesh.comm.rank == 0:
+                print(f"  ⚠️  Failed to build MPC for diagonal symmetry: {e}")
+            mpc = None
 
 
 
@@ -151,17 +188,23 @@ def form_fem(fem, opt):
 
     linear_problem = LinearProblem(u_field, lambda_field, lhs, rhs, opt["l_vec"],
                                    spring_vec, bcs, fem["petsc_options"],
-                                   gpu_accel=fem.get("gpu_accel", False))
+                                   gpu_accel=fem.get("gpu_accel", False),
+                                   mpc=mpc)
 
 
     # Define optimization-related variables
     # When symmetry planes reduce the computational domain, the integrals
-    # (compliance, f_int) only cover 1/2^n of the full domain.  Scale them
-    # so that objective values and sensitivities are consistent with the
-    # full-domain problem.  Volume fraction (volume/total_volume) is a ratio
-    # of integrals over the same domain and therefore needs no correction.
-    n_sym = len(fem.get("symmetry_bcs", []))
-    sym_factor = 2 ** n_sym  # 1 if no symmetry
+    # (compliance, f_int) only cover a fraction of the full domain.  Scale
+    # them so that objective values and sensitivities are consistent with
+    # the full-domain problem.  Volume fraction (volume/total_volume) is a
+    # ratio of integrals over the same domain and therefore needs no
+    # correction.
+    sym_factor = 1
+    for sbc in fem.get("symmetry_bcs", []):
+        if sbc.get("type") == "rotational_c4":
+            sym_factor *= 4  # quarter domain (90° sector)
+        else:
+            sym_factor *= 2  # half domain (mirror plane)
 
     opt["f_int"] = sym_factor * ufl.inner(sigma(u_field), epsilon(v))*dx
     opt["compliance"] = sym_factor * ufl.inner(sigma(u_field), epsilon(u_field))*dx

@@ -59,20 +59,38 @@ def create_mechanism_vectors(func_space, in_spring, out_spring):
 
 
 class LinearProblem:
-    def __init__(self, u, lam, lhs, rhs, l_vec, spring_vec, bcs=[], petsc_options={}, gpu_accel=False):
-        """Initialize a linear problem."""
+    def __init__(self, u, lam, lhs, rhs, l_vec, spring_vec, bcs=[], petsc_options={}, gpu_accel=False, mpc=None):
+        """Initialize a linear problem.
+
+        Parameters
+        ----------
+        mpc : dolfinx_mpc.MultiPointConstraint, optional
+            If provided, assembly and solve use dolfinx_mpc routines to
+            enforce multi-point constraints (e.g. diagonal symmetry slip BCs).
+        """
         # Initialization
         self.u, self.lam = u, lam
         self.u_wrap = self.u.x.petsc_vec
         self.lam_wrap = self.lam.x.petsc_vec
         self.lhs_form, self.rhs_form = form(lhs), form(rhs)
-        self.lhs_mat = create_matrix(self.lhs_form)
-        self.rhs_vec = create_vector(self.rhs_form.function_spaces[0])
         self.bcs = bcs
         self.l_vec_wrap = l_vec
         self.spring_vec_wrap = spring_vec
         self.l_vec = l_vec.petsc_vec if l_vec is not None else None
         self.spring_vec = spring_vec.petsc_vec if spring_vec is not None else None
+
+        # MPC support
+        self.mpc = mpc
+        if mpc is not None:
+            import dolfinx_mpc as _dmpc
+            self._dmpc = _dmpc
+            # Use dolfinx_mpc to create the matrix with the correct sparsity
+            self.lhs_mat = _dmpc.assemble_matrix(self.lhs_form, mpc, bcs=self.bcs)
+        else:
+            self._dmpc = None
+            self.lhs_mat = create_matrix(self.lhs_form)
+
+        self.rhs_vec = create_vector(self.rhs_form.function_spaces[0])
 
         # Construct a linear solver
         self.solver = PETSc.KSP().create(self.u.function_space.mesh.comm)
@@ -119,6 +137,9 @@ class LinearProblem:
                     print(f"      Reason: {type(e).__name__}: {e}")
 
         assemble_vector(self.rhs_vec, self.rhs_form)
+        if self.mpc is not None:
+            self._dmpc.apply_lifting(
+                self.rhs_vec, [self.lhs_form], [self.bcs], self.mpc)
         self.rhs_vec.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
         set_bc(self.rhs_vec, self.bcs)
 
@@ -131,7 +152,11 @@ class LinearProblem:
         if self.use_gpu and self._gpu_active:
             self.lhs_mat.setType("aij")
         self.lhs_mat.zeroEntries()
-        assemble_matrix(self.lhs_mat, self.lhs_form, bcs=self.bcs)
+        if self.mpc is not None:
+            self._dmpc.assemble_matrix(self.lhs_form, self.mpc,
+                                       bcs=self.bcs, A=self.lhs_mat)
+        else:
+            assemble_matrix(self.lhs_mat, self.lhs_form, bcs=self.bcs)
         self.lhs_mat.assemble()
         if self.spring_vec_wrap is not None:
             self.lhs_mat.setDiagonal(self.lhs_mat.getDiagonal() + self.spring_vec)
@@ -160,6 +185,9 @@ class LinearProblem:
             self.solver.solve(self.rhs_vec, self.u_wrap)
         stats.stop('solve')
         
+        # MPC: recover slave DOF values from the reduced solution
+        if self.mpc is not None:
+            self.mpc.backsubstitution(self.u)
         self.u.x.scatter_forward()
     
     def _solve_cg_gpu(self, b, x, rtol=1e-8, max_it=5000):
