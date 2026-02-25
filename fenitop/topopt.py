@@ -19,40 +19,53 @@ Reference:
 """
 
 import time
-import os
 
 import numpy as np
 from mpi4py import MPI
-import dolfinx.fem  # Added for rank-0 saving
+import dolfinx.fem
 
-from fenitop.fem import form_fem, compute_von_mises
+from fenitop.fem import form_fem
 from fenitop.parameterize import DensityFilter, Heaviside
 from fenitop.sensitivity import Sensitivity
 from fenitop.optimize import optimality_criteria, mma_optimizer
-from fenitop.utility import Communicator, Plotter, save_xdmf
+from fenitop.utility import Communicator, save_xdmf
 
 
-def get_logical_rank(comm):
-    """Determine rank even if mpi4py didn't initialize correctly."""
-    if comm.size > 1:
-        return comm.rank
+def topopt(fem, opt, on_iteration=None, on_setup=None, on_finish=None):
+    """Main function for topology optimization.
 
-    # Fallback checks for common MPI environment variables
-    for key in ['PMI_RANK', 'OMPI_COMM_WORLD_RANK', 'MPI_LOCALRANKID', 'MV2_COMM_WORLD_RANK', 'SLURM_PROCID']:
-        if key in os.environ:
-            try:
-                return int(os.environ[key])
-            except ValueError:
-                pass
-    return 0
+    Parameters
+    ----------
+    fem : dict
+        FEM problem definition.
+    opt : dict
+        Optimization settings.
+    on_iteration : callable, optional
+        Called on **all MPI ranks** after each iteration as
+        ``on_iteration(iter, C, V, change) -> bool | None``.
+        Return ``False`` to stop the optimization early.
+        MPI collectives (e.g. field gathers) are safe inside this callback.
+    on_setup : callable, optional
+        Called once on **all MPI ranks** immediately after the FEM problem is
+        set up (after form_fem, before the optimization loop).  Signature::
 
+            on_setup(u_field, rho_field, rho_phys_field,
+                     S_comm, S_comm_phys, V_comm, fem_dict)
 
-def topopt(fem, opt):
-    """Main function for topology optimization."""
+        Use this to capture live field references for use inside on_iteration.
+    on_finish : callable, optional
+        Called once on **all MPI ranks** just before topopt returns, while all
+        PETSc/MPI objects are still alive.  Signature::
+
+            on_finish(u_field, rho_field, rho_phys_field,
+                      S_comm, S_comm_phys, V_comm, fem_dict)
+
+        Use this to perform any final field gathers safely.
+    """
 
     # Initialization
     comm = MPI.COMM_WORLD
-    rank = get_logical_rank(comm)
+    rank = comm.rank
 
     linear_problem, u_field, lambda_field, rho_field, rho_phys_field = form_fem(fem, opt)
     density_filter = DensityFilter(comm, rho_field, rho_phys_field,
@@ -65,9 +78,12 @@ def topopt(fem, opt):
     S_comm_phys = Communicator(rho_phys_field.function_space, fem["mesh_serial"])
     V_comm = Communicator(u_field.function_space, fem["mesh_serial"])
 
-
-    if rank == 0:  # Changed from comm.rank
-        plotter = Plotter(fem["mesh_serial"])
+    # Notify caller of live field references before the loop starts.
+    if on_setup is not None:
+        try:
+            on_setup(u_field, rho_field, rho_phys_field, S_comm, S_comm_phys, V_comm, fem)
+        except Exception:
+            pass
 
 
     num_consts = 1 if opt["opt_compliance"] else 2
@@ -103,9 +119,6 @@ def topopt(fem, opt):
     rho_min[solid], rho_max[void] = 0.99, 0.01
 
     # Restore optimizer state for resume.
-    # opt["beta"] and opt["opt_iter"] carry the saved values for all solver types.
-    # For MMA, additionally restore the two previous iterates and asymptote bounds
-    # so the very first resumed step is numerically identical to a straight run.
     resume_opt_iter = int(opt.get("opt_iter", 0)) if initial_rho is not None else 0
     resume_beta     = int(opt.get("beta", 1))      if initial_rho is not None else 1
 
@@ -119,6 +132,7 @@ def topopt(fem, opt):
 
     # Start topology optimization
     opt_iter, beta, change = resume_opt_iter, resume_beta, 2*opt["opt_tol"]
+    stopped_early = False
     while opt_iter < opt["max_iter"] and change > opt["opt_tol"]:
         opt_start_time = time.perf_counter()
         opt_iter += 1
@@ -135,7 +149,6 @@ def topopt(fem, opt):
         stats.stop('filter')
 
         # Solve FEM
-        # (Timing is handled inside solve_fem)
         linear_problem.solve_fem()
 
         # Compute function values and sensitivities
@@ -167,7 +180,7 @@ def topopt(fem, opt):
 
         # Check for NaN values and stop optimization if detected
         if np.isnan(change) or np.any(np.isnan(rho_new)):
-            if rank == 0:  # Changed from comm.rank
+            if rank == 0:
                 print(f"\n⚠️  WARNING: NaN detected at iteration {opt_iter}. Stopping optimization.")
                 print(f"   Using design from iteration {opt_iter-1}.")
             break
@@ -181,38 +194,25 @@ def topopt(fem, opt):
         # Output the histories
         opt_time = time.perf_counter() - opt_start_time
 
-        # Call progress callback or print status (Rank 0 only)
-        if rank == 0:  # Changed from comm.rank
-            if "progress_callback" in opt and opt["progress_callback"] is not None:
-                try:
-                    should_continue = opt["progress_callback"](
-                        opt_iter, C_value, V_value, change, 
-                        field=rho_phys_field, comm=S_comm_phys,
-                        u_field=u_field, fem=fem, V_comm=V_comm, S_comm=S_comm
-                    )
-                    if should_continue is False:
-                        break
-                except Exception:
-                    pass  # Silently ignore callback errors
-            else:
+        if on_iteration is not None:
+            # Called on ALL ranks so that MPI collectives inside the callback
+            # (e.g. Communicator.gather) work correctly across processes.
+            try:
+                should_continue = on_iteration(opt_iter, C_value, V_value, change)
+            except Exception:
+                should_continue = True
+            # Rank 0 decides whether to stop; broadcast to all ranks.
+            should_continue = comm.bcast(should_continue, root=0)
+            if should_continue is False:
+                stopped_early = True
+                break
+        else:
+            if rank == 0:
                 print(f"opt_iter: {opt_iter}, opt_time: {opt_time:.3g} (s), "
                       f"beta: {beta}, C: {C_value:.3f}, V: {V_value:.3f}, "
                       f"U: {U_value:.3f}, change: {change:.3f}", flush=True)
 
-    design_values = S_comm.gather(rho_field.x.petsc_vec)
-    physical_values = S_comm_phys.gather(rho_phys_field.x.petsc_vec) 
-    
-    # Calculate Von Mises Stress
-    stress_field = compute_von_mises(u_field, fem)
-    # Communicator for stress (DG0 same as density)
-    stress_values = S_comm.gather(stress_field.x.petsc_vec)
-    
-    # Gather Displacement
-    displacement_values = V_comm.gather(u_field.x.petsc_vec)
-
-    # Save raw local density array for resume.
-    # S_comm.gather() reorders to serial-mesh ordering; saving the raw local array
-    # avoids any permutation issue when assigning back to rho_field on resume.
+    # Save raw local density array — always safe (local, no MPI).
     design_raw = rho_field.x.petsc_vec.array[:num_elems].copy()
 
     # MMA history for resume (rho_old1/2 and asymptote bounds).
@@ -225,6 +225,34 @@ def topopt(fem, opt):
             "upp": upp.copy() if upp is not None else None,
         }
 
+    # Skip MPI-collective gathers when stopped early — the process may be
+    # killed shortly after on_iteration returns False, and calling a collective
+    # while another rank is already dead causes a segfault.
+    # The GUI adapter fills design/physical from _captured instead.
+    if stopped_early:
+        # Call on_finish before returning so the adapter can safely gather
+        # fields while all PETSc objects are still alive.
+        if on_finish is not None:
+            try:
+                on_finish(u_field, rho_field, rho_phys_field,
+                          S_comm, S_comm_phys, V_comm, fem)
+            except Exception:
+                pass
+        final_results = None
+        if rank == 0:
+            final_results = {
+                "design": None,
+                "design_raw": design_raw,
+                "beta": beta,
+                "opt_iter": opt_iter,
+                "physical": None,
+                "mma_state": mma_state,
+            }
+        return final_results
+
+    design_values = S_comm.gather(rho_field.x.petsc_vec)
+    physical_values = S_comm_phys.gather(rho_phys_field.x.petsc_vec)
+
     final_results = None
     if rank == 0:
         final_results = {
@@ -233,31 +261,24 @@ def topopt(fem, opt):
             "beta": beta,
             "opt_iter": opt_iter,
             "physical": physical_values,
-            "displacement": displacement_values,
-            "von_mises": stress_values,
             "mma_state": mma_state,
         }
-        
-        # 1. JPG Visualization - conditionally skip if running in GUI
-        # (User request: detect GUI context dynamically via environment variable set by run_gui.py)
-        is_gui_running = os.environ.get("FENITOP_GUI_MODE") == "1"
-        
-        if not is_gui_running:
+
+        # Only produce file output when running in script/CLI mode.
+        # When on_iteration is provided the caller manages its own output (e.g. GUI).
+        if on_iteration is None:
             try:
-                print(f"\n📊 Creating JPG visualization...")
-                print(f"   Density range: [{np.min(physical_values):.3f}, {np.max(physical_values):.3f}]")
+                from fenitop_gui.visualization.plotter import Plotter
+                plotter = Plotter(fem["mesh_serial"])
                 filename = opt.get("filename", "optimized_design")
+                print(f"\n📊 Creating JPG visualization...")
                 plotter.plot(physical_values, filename=filename)
                 print(f"✅ JPG visualization created: {filename}.jpg")
+            except ImportError:
+                pass  # fenitop_gui not available (e.g. HPC / headless environment)
             except Exception as e:
                 print(f"⚠️  Warning: Failed to create JPG visualization: {e}")
-                import traceback
-                traceback.print_exc()
-        else:
-            print("   ℹ️  JPG visualization skipped (GUI mode detected).")
 
-        # 2. XDMF Saving
-        if not is_gui_running:
             try:
                 filename = opt.get("filename", "optimized_design")
                 V_serial = dolfinx.fem.functionspace(fem["mesh_serial"], rho_phys_field.function_space.ufl_element())
@@ -266,9 +287,14 @@ def topopt(fem, opt):
                 save_xdmf(fem["mesh_serial"], rho_serial, filename=filename)
             except Exception as e:
                 print(f"⚠️  Warning: Failed to save XDMF: {e}")
-        else:
-            print("   ℹ️  XDMF saving skipped (GUI mode detected).")
 
-    
+    # Call on_finish before returning — PETSc objects are still alive here.
+    if on_finish is not None:
+        try:
+            on_finish(u_field, rho_field, rho_phys_field,
+                      S_comm, S_comm_phys, V_comm, fem)
+        except Exception:
+            pass
+
     return final_results
 
