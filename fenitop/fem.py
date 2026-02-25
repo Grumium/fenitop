@@ -66,6 +66,24 @@ def form_fem(fem, opt):
     bc = dirichletbc(Constant(mesh, np.full(dim, 0.0)),
                      locate_dofs_topological(V, fdim, disp_facets), V)
 
+    bcs = [bc]
+
+    # Symmetry roller BCs: constrain normal displacement to zero on each
+    # symmetry plane.  Each entry in "symmetry_bcs" is a dict with keys
+    # "locator" (callable), "component" (int), "value" (float, usually 0).
+    for sym_bc in fem.get("symmetry_bcs", []):
+        sym_facets = locate_entities_boundary(mesh, fdim, sym_bc["locator"])
+        comp = sym_bc["component"]  # 0=x, 1=y, 2=z
+        # Constrain only the single DOF component (sub-space of V)
+        V_sub = V.sub(comp)
+        V_collapsed, _ = V_sub.collapse()
+        sym_dofs = locate_dofs_topological(
+            (V_sub, V_collapsed), fdim, sym_facets)
+        sym_val = Function(V_collapsed)
+        sym_val.x.array[:] = 0.0
+        sym_dirichlet = dirichletbc(sym_val, sym_dofs, V_sub)
+        bcs.append(sym_dirichlet)
+
 
 
     tractions, facets, markers = [], [], []
@@ -99,17 +117,57 @@ def form_fem(fem, opt):
     else:
         spring_vec, opt["l_vec"] = create_mechanism_vectors(
             V, opt["in_spring"], opt["out_spring"])
-    
+
+        # When exploiting symmetry, nodes that sit exactly on a symmetry
+        # plane appear in both the kept half and (conceptually) the
+        # mirrored half.  The sym_factor will multiply spring/l_vec
+        # contributions by 2^n, so we must halve the values at those
+        # boundary nodes to avoid double-counting.
+        sym_bcs = fem.get("symmetry_bcs", [])
+        if sym_bcs and spring_vec is not None:
+            mesh_dim = mesh.geometry.dim
+            num_local = V.dofmap.index_map.size_local
+            coords = V.tabulate_dof_coordinates()[:num_local]
+            block_size = V.dofmap.index_map_bs
+            on_sym = np.zeros(num_local, dtype=bool)
+            for sbc in sym_bcs:
+                on_sym |= sbc["locator"](coords.T)
+            if np.any(on_sym):
+                sym_dofs = []
+                for node_idx in np.where(on_sym)[0]:
+                    for d in range(block_size):
+                        sym_dofs.append(node_idx * block_size + d)
+                sym_dofs = np.array(sym_dofs, dtype=np.int32)
+                # Halve spring stiffness at symmetry-plane nodes
+                sv = spring_vec.petsc_vec
+                sv_arr = sv.array.copy()
+                sv_arr[sym_dofs] *= 0.5
+                sv.array[:] = sv_arr
+                # Halve l_vec (output spring load vector) at symmetry-plane nodes
+                lv = opt["l_vec"].petsc_vec
+                lv_arr = lv.array.copy()
+                lv_arr[sym_dofs] *= 0.5
+                lv.array[:] = lv_arr
+
     linear_problem = LinearProblem(u_field, lambda_field, lhs, rhs, opt["l_vec"],
-                                   spring_vec, [bc], fem["petsc_options"],
+                                   spring_vec, bcs, fem["petsc_options"],
                                    gpu_accel=fem.get("gpu_accel", False))
 
 
     # Define optimization-related variables
-    opt["f_int"] = ufl.inner(sigma(u_field), epsilon(v))*dx
-    opt["compliance"] = ufl.inner(sigma(u_field), epsilon(u_field))*dx
+    # When symmetry planes reduce the computational domain, the integrals
+    # (compliance, f_int) only cover 1/2^n of the full domain.  Scale them
+    # so that objective values and sensitivities are consistent with the
+    # full-domain problem.  Volume fraction (volume/total_volume) is a ratio
+    # of integrals over the same domain and therefore needs no correction.
+    n_sym = len(fem.get("symmetry_bcs", []))
+    sym_factor = 2 ** n_sym  # 1 if no symmetry
+
+    opt["f_int"] = sym_factor * ufl.inner(sigma(u_field), epsilon(v))*dx
+    opt["compliance"] = sym_factor * ufl.inner(sigma(u_field), epsilon(u_field))*dx
     opt["volume"] = rho_phys_field*dx
     opt["total_volume"] = Constant(mesh, 1.0)*dx
+    opt["_sym_factor"] = sym_factor
 
     return linear_problem, u_field, lambda_field, rho_field, rho_phys_field
 

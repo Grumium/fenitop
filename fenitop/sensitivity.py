@@ -28,6 +28,12 @@ from petsc4py import PETSc
 
 class Sensitivity():
     def __init__(self, comm, opt, problem, u_field, lambda_field, rho_phys):
+        # Symmetry scaling factor (2^n for n symmetry planes).
+        # The UFL forms (compliance, f_int) already include this factor,
+        # but the matrix-vector path (u^T K u) for opt_compliance=False
+        # needs explicit scaling.
+        self.sym_factor = opt.get("_sym_factor", 1)
+
         # Compliance
         if opt["opt_compliance"]:
             self.C_form = form(opt["compliance"])
@@ -65,11 +71,13 @@ class Sensitivity():
     def evaluate(self):
         # Compliance
         if self.opt_compliance:
-            # Use standard MPI sum for speed (non-deterministic but faster)
+            # Uses the (already symmetry-scaled) UFL form
             C_value = self.comm.allreduce(assemble_scalar(self.C_form), op=MPI.SUM)
         else:
+            # Matrix-vector path: u^T K u integrates only over the reduced
+            # domain — apply the symmetry factor explicitly.
             self.problem.lhs_mat.mult(self.u_field.x.petsc_vec, self.prod_vec)
-            C_value = self.u_field.x.petsc_vec.dot(self.prod_vec)
+            C_value = self.u_field.x.petsc_vec.dot(self.prod_vec) * self.sym_factor
         with self.dCdrho_vec.localForm() as loc:
             loc.set(0)
         assemble_vector(self.dCdrho_vec, self.dCdrho_form)
@@ -81,7 +89,7 @@ class Sensitivity():
 
         # Displacement
         if not self.opt_compliance:
-            U_value = self.u_field.x.petsc_vec.dot(self.l_vec)
+            U_value = self.u_field.x.petsc_vec.dot(self.l_vec) * self.sym_factor
             self.problem.solve_adjoint()
             self.dfdrho_mat.zeroEntries()
             assemble_matrix(self.dfdrho_mat, self.dfdrho_form)
