@@ -98,16 +98,25 @@ def topopt(fem, opt, on_iteration=None, on_setup=None, on_finish=None):
 
     solid, void = opt["solid_zone"](centers), opt["void_zone"](centers)
     initial_rho = opt.get("initial_density")
+    num_elems_global = rho_field.function_space.dofmap.index_map.size_global
     if initial_rho is not None:
-        if len(initial_rho) == num_elems:
+        # initial_density is always the GLOBAL array (rank-0 gathered from a
+        # previous run, size == num_elems_global).  Broadcast it to all ranks
+        # then use S_comm.bcast to scatter each rank's local slice.
+        if len(initial_rho) == num_elems_global:
             if rank == 0:
                 print("   ✅ Resuming optimization from previous state.")
-            rho_ini = initial_rho.copy()
+            # MPI-broadcast so all ranks have the global array
+            initial_rho_global = comm.bcast(initial_rho, root=0)
+            # S_comm.bcast is a local indexing op — distributes global→local DOFs
+            S_comm.bcast(rho_field, initial_rho_global)
+            rho_ini = rho_field.x.petsc_vec.array[:num_elems].copy()
             rho_ini[solid], rho_ini[void] = 0.995, 0.005
             rho_field.x.petsc_vec.array[:num_elems] = rho_ini
         else:
             if rank == 0:
-                print(f"   ⚠️  Resume failed: size mismatch (expected {num_elems}, got {len(initial_rho)}). Starting fresh.")
+                print(f"   ⚠️  Resume failed: size mismatch "
+                      f"(expected {num_elems_global}, got {len(initial_rho)}). Starting fresh.")
             initial_rho = None  # fall through to fresh start
     if initial_rho is None:
         rho_ini = np.full(num_elems, opt["vol_frac"])
@@ -124,11 +133,24 @@ def topopt(fem, opt, on_iteration=None, on_setup=None, on_finish=None):
 
     if not opt["use_oc"]:
         ms = opt.get("mma_state") or {}
-        if ms and len(ms.get("rho_old1", [])) == num_elems:
-            rho_old1 = ms["rho_old1"].copy()
-            rho_old2 = ms["rho_old2"].copy()
-            low = ms.get("low")
-            upp = ms.get("upp")
+        if ms and len(ms.get("rho_old1") or []) == num_elems_global:
+            # Global arrays — scatter to each rank's local slice via S_comm.bcast
+            import dolfinx.fem as _dfem
+            _tmp = _dfem.Function(rho_field.function_space)
+            for key, target in [("rho_old1", None), ("rho_old2", None),
+                                 ("low", None), ("upp", None)]:
+                val = ms.get(key)
+                if val is not None:
+                    g = comm.bcast(val, root=0)
+                    S_comm.bcast(_tmp, g)
+                    if key == "rho_old1":
+                        rho_old1 = _tmp.x.petsc_vec.array[:num_elems].copy()
+                    elif key == "rho_old2":
+                        rho_old2 = _tmp.x.petsc_vec.array[:num_elems].copy()
+                    elif key == "low":
+                        low = _tmp.x.petsc_vec.array[:num_elems].copy()
+                    elif key == "upp":
+                        upp = _tmp.x.petsc_vec.array[:num_elems].copy()
 
     # Start topology optimization
     opt_iter, beta, change = resume_opt_iter, resume_beta, 2*opt["opt_tol"]
@@ -212,17 +234,19 @@ def topopt(fem, opt, on_iteration=None, on_setup=None, on_finish=None):
                       f"beta: {beta}, C: {C_value:.3f}, V: {V_value:.3f}, "
                       f"U: {U_value:.3f}, change: {change:.3f}", flush=True)
 
-    # Save raw local density array — always safe (local, no MPI).
-    design_raw = rho_field.x.petsc_vec.array[:num_elems].copy()
+    # Save design_raw as the GLOBAL gathered array so it can be scattered back
+    # to any number of MPI ranks on resume (local partition sizes vary by rank count).
+    design_raw = S_comm.gather(rho_field.x.petsc_vec)
 
-    # MMA history for resume (rho_old1/2 and asymptote bounds).
+    # MMA history for resume — saved as GLOBAL arrays (rank 0 only) so they
+    # can be scattered back to any number of MPI ranks on resume.
     mma_state = None
     if not opt["use_oc"]:
         mma_state = {
-            "rho_old1": rho_old1.copy(),
-            "rho_old2": rho_old2.copy(),
-            "low": low.copy() if low is not None else None,
-            "upp": upp.copy() if upp is not None else None,
+            "rho_old1": S_comm.gather(rho_old1),
+            "rho_old2": S_comm.gather(rho_old2),
+            "low":  S_comm.gather(low)  if low is not None else None,
+            "upp":  S_comm.gather(upp)  if upp is not None else None,
         }
 
     # Skip MPI-collective gathers when stopped early — the process may be

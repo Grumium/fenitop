@@ -314,9 +314,13 @@ class Communicator():
 
     def bcast(self, func, global_values):
         """Broadcast data from Process 0 to all the other processes."""
-        if len(func.x.array) != global_values.size:
-            raise ValueError("Mismatched sizes.")
-        func.x.array[:] = global_values[self.idx]
+        # global_values has size num_global_dofs; func.x.array may include ghost
+        # DOFs and be larger — only fill the owned slice via self.idx.
+        if global_values.size != self.num_global_dofs * self.size:
+            raise ValueError(
+                f"Mismatched sizes: global_values has {global_values.size} entries "
+                f"but expected {self.num_global_dofs * self.size}.")
+        func.x.array[:len(self.idx)] = global_values[self.idx]
 
     def gather(self, func):
         """Gather data to Process 0 from all the other processes."""
