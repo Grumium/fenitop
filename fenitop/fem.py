@@ -94,12 +94,18 @@ def form_fem(fem, opt):
     rot_sym_bcs = [s for s in fem.get("symmetry_bcs", [])
                    if s.get("type") == "rotational_c4"]
 
+    # Tabulate DOF coordinates once — reused by MPC builder and mechanism
+    # vectors below to avoid redundant (identical) calls.
+    num_local = V.dofmap.index_map.size_local
+    owned_dof_coords = V.tabulate_dof_coordinates()[:num_local]
+
     if rot_sym_bcs:
         # Rotational C4 (cyclic periodic) takes priority
         try:
             from fenitop_gui.adapter.symmetry import build_mpc_cyclic_constraints
             rot_data = rot_sym_bcs[0].get("rot_sym", rot_sym_bcs[0])
-            mpc = build_mpc_cyclic_constraints(V, mesh, rot_data, bcs)
+            mpc = build_mpc_cyclic_constraints(V, mesh, rot_data, bcs,
+                                               owned_dof_coords=owned_dof_coords)
             if mpc is not None and mesh.comm.rank == 0:
                 print(f"  🔗 MPC cyclic constraint active (C4 rotational, "
                       f"{mpc.num_local_slaves} local slave DOFs)")
@@ -153,7 +159,8 @@ def form_fem(fem, opt):
         spring_vec = opt["l_vec"] = None
     else:
         spring_vec, opt["l_vec"] = create_mechanism_vectors(
-            V, opt["in_spring"], opt["out_spring"])
+            V, opt["in_spring"], opt["out_spring"],
+            dof_coords=owned_dof_coords)
 
         # When exploiting symmetry, nodes that sit exactly on a symmetry
         # plane appear in both the kept half and (conceptually) the
@@ -162,19 +169,17 @@ def form_fem(fem, opt):
         # boundary nodes to avoid double-counting.
         sym_bcs = fem.get("symmetry_bcs", [])
         if sym_bcs and spring_vec is not None:
-            mesh_dim = mesh.geometry.dim
-            num_local = V.dofmap.index_map.size_local
-            coords = V.tabulate_dof_coordinates()[:num_local]
             block_size = V.dofmap.index_map_bs
             on_sym = np.zeros(num_local, dtype=bool)
             for sbc in sym_bcs:
-                on_sym |= sbc["locator"](coords.T)
+                loc = sbc.get("locator")
+                if loc is None:
+                    continue  # rotational_c4 entries have no locator
+                on_sym |= loc(owned_dof_coords.T)
             if np.any(on_sym):
-                sym_dofs = []
-                for node_idx in np.where(on_sym)[0]:
-                    for d in range(block_size):
-                        sym_dofs.append(node_idx * block_size + d)
-                sym_dofs = np.array(sym_dofs, dtype=np.int32)
+                node_idx = np.where(on_sym)[0]
+                sym_dofs = (node_idx[:, None] * block_size
+                            + np.arange(block_size)).ravel().astype(np.int32)
                 # Halve spring stiffness at symmetry-plane nodes
                 sv = spring_vec.petsc_vec
                 sv_arr = sv.array.copy()
@@ -190,6 +195,27 @@ def form_fem(fem, opt):
                                    spring_vec, bcs, fem["petsc_options"],
                                    gpu_accel=fem.get("gpu_accel", False),
                                    mpc=mpc)
+
+    # When MPC is active, re-create u_field and lambda_field from the MPC's
+    # function space.  After mpc.finalize(), the MPC replaces V's index map
+    # with one that includes remote master DOFs as extra ghosts.  Without
+    # this, scatter_forward() on u_field won't fetch the master values
+    # needed by backsubstitution, causing NaN in MPI runs.
+    if mpc is not None:
+        V_mpc = mpc.function_space
+        u_field_new = Function(V_mpc)
+        lambda_field_new = Function(V_mpc)
+        # Copy any existing data (should be zero at this point)
+        n = min(len(u_field.x.array), len(u_field_new.x.array))
+        u_field_new.x.array[:n] = u_field.x.array[:n]
+        lambda_field_new.x.array[:n] = lambda_field.x.array[:n]
+        u_field = u_field_new
+        lambda_field = lambda_field_new
+        # Update linear_problem to use the new functions
+        linear_problem.u = u_field
+        linear_problem.u_wrap = u_field.x.petsc_vec
+        linear_problem.lam = lambda_field
+        linear_problem.lam_wrap = lambda_field.x.petsc_vec
 
 
     # Define optimization-related variables

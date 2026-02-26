@@ -28,8 +28,15 @@ from dolfinx import la
 from dolfinx.fem.petsc import (create_vector, create_matrix,
                                assemble_vector, assemble_matrix, set_bc)
 
-def create_mechanism_vectors(func_space, in_spring, out_spring):
-    """Create vectors for compliant mechanism design."""
+def create_mechanism_vectors(func_space, in_spring, out_spring, dof_coords=None):
+    """Create vectors for compliant mechanism design.
+
+    Parameters
+    ----------
+    dof_coords : ndarray, optional
+        Pre-computed ``func_space.tabulate_dof_coordinates()[:num_local]``.
+        Avoids a redundant call when the caller already has them.
+    """
     index_map = func_space.dofmap.index_map
     block_size = func_space.dofmap.index_map_bs
     spring_vec_wrap = la.vector(index_map, block_size)
@@ -42,7 +49,10 @@ def create_mechanism_vectors(func_space, in_spring, out_spring):
     local_range = index_map.local_range
     local_indices = np.arange(local_range[0], local_range[1]).astype(np.int32)
     num_local_nodes = index_map.size_local
-    local_nodes = func_space.tabulate_dof_coordinates()[:num_local_nodes]
+    if dof_coords is None:
+        local_nodes = func_space.tabulate_dof_coordinates()[:num_local_nodes]
+    else:
+        local_nodes = dof_coords
 
     for n, (locator, direction, value) in enumerate([in_spring, out_spring]):
         ctrl_nodes = local_indices[locator(local_nodes.T)]
@@ -109,6 +119,15 @@ class LinearProblem:
         self.lhs_mat.setOptionsPrefix(prefix)
         self.lhs_mat.setFromOptions()
 
+        # For iterative solvers (CG, GMRES, etc.), enable warm-starting from
+        # the previous solution.  In topology optimization the design changes
+        # incrementally, so the prior displacement field is an excellent initial
+        # guess that typically halves the Krylov iteration count.
+        self._iterative = petsc_options.get("ksp_type", "preonly") != "preonly"
+        if self._iterative:
+            self.solver.setInitialGuessNonzero(True)
+        self._first_solve = True
+
         # GPU acceleration (opt-in via --gpu flag)
         self.use_gpu = False
         self._gpu_active = False
@@ -161,6 +180,13 @@ class LinearProblem:
         if self.spring_vec_wrap is not None:
             self.lhs_mat.setDiagonal(self.lhs_mat.getDiagonal() + self.spring_vec)
         
+        # For iterative solvers: after the first solve, tell PETSc the
+        # sparsity pattern hasn't changed so GAMG/AMG can reuse the
+        # coarsening hierarchy and only recompute the smoother weights.
+        if self._iterative and not self._first_solve:
+            self.solver.setOperators(self.lhs_mat, self.lhs_mat)
+        self._first_solve = False
+
         if self.use_gpu:
             comm = self.u.function_space.mesh.comm
             # Get diagonal for Jacobi BEFORE switching to GPU type
@@ -185,8 +211,12 @@ class LinearProblem:
             self.solver.solve(self.rhs_vec, self.u_wrap)
         stats.stop('solve')
         
-        # MPC: recover slave DOF values from the reduced solution
+        # MPC: recover slave DOF values from the reduced solution.
+        # scatter_forward() BEFORE backsubstitution ensures ghost master
+        # DOF values are up-to-date on ranks that own slave DOFs — without
+        # this, cross-rank master reads are stale and produce NaN/wrong values.
         if self.mpc is not None:
+            self.u.x.scatter_forward()
             self.mpc.backsubstitution(self.u)
         self.u.x.scatter_forward()
     
@@ -277,6 +307,10 @@ class LinearProblem:
             self.solver.solve(rhs, self.lam_wrap)
         rhs.destroy()
         stats.stop('solve')
+        # MPC: recover slave DOF values (same pattern as solve_fem)
+        if self.mpc is not None:
+            self.lam.x.scatter_forward()
+            self.mpc.backsubstitution(self.lam)
         self.lam.x.scatter_forward()
 
     def __del__(self):
