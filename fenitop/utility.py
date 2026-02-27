@@ -28,7 +28,7 @@ from dolfinx import la
 from dolfinx.fem.petsc import (create_vector, create_matrix,
                                assemble_vector, assemble_matrix, set_bc)
 
-def create_mechanism_vectors(func_space, in_spring, out_spring, dof_coords=None):
+def create_mechanism_vectors(func_space, in_spring, out_spring, dof_coords=None, out_sign=1):
     """Create vectors for compliant mechanism design.
 
     Parameters
@@ -36,6 +36,10 @@ def create_mechanism_vectors(func_space, in_spring, out_spring, dof_coords=None)
     dof_coords : ndarray, optional
         Pre-computed ``func_space.tabulate_dof_coordinates()[:num_local]``.
         Avoids a redundant call when the caller already has them.
+    out_sign : int, optional
+        Sign for the output (effector) direction in ``l_vec``.
+        +1 (default) maximises displacement in the positive axis direction,
+        -1 maximises displacement in the negative direction.
     """
     index_map = func_space.dofmap.index_map
     block_size = func_space.dofmap.index_map_bs
@@ -61,8 +65,8 @@ def create_mechanism_vectors(func_space, in_spring, out_spring, dof_coords=None)
         # Use PETSc setValues for MPI-safe global index handling
         spring_vec.setValues(ctrl_dofs, [value,]*ctrl_dofs.size)
         if n == 1:
-            l_vec.setValues(ctrl_dofs, [1.0,]*ctrl_dofs.size)
-    
+            l_vec.setValues(ctrl_dofs, [float(out_sign),]*ctrl_dofs.size)
+
     spring_vec.assemble()
     l_vec.assemble()
     return spring_vec_wrap, l_vec_wrap

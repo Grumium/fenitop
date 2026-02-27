@@ -133,7 +133,8 @@ def topopt(fem, opt, on_iteration=None, on_setup=None, on_finish=None):
 
     if not opt["use_oc"]:
         ms = opt.get("mma_state") or {}
-        if ms and len(ms.get("rho_old1") or []) == num_elems_global:
+        _rho_old1 = ms.get("rho_old1")
+        if ms and _rho_old1 is not None and len(_rho_old1) == num_elems_global:
             # Global arrays — scatter to each rank's local slice via S_comm.bcast
             import dolfinx.fem as _dfem
             _tmp = _dfem.Function(rho_field.function_space)

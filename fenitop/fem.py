@@ -160,7 +160,8 @@ def form_fem(fem, opt):
     else:
         spring_vec, opt["l_vec"] = create_mechanism_vectors(
             V, opt["in_spring"], opt["out_spring"],
-            dof_coords=owned_dof_coords)
+            dof_coords=owned_dof_coords,
+            out_sign=opt.get("out_spring_sign", 1))
 
         # When exploiting symmetry, nodes that sit exactly on a symmetry
         # plane appear in both the kept half and (conceptually) the
