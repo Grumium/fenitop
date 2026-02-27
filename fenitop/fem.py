@@ -193,7 +193,6 @@ def form_fem(fem, opt):
 
     linear_problem = LinearProblem(u_field, lambda_field, lhs, rhs, opt["l_vec"],
                                    spring_vec, bcs, fem["petsc_options"],
-                                   gpu_accel=fem.get("gpu_accel", False),
                                    mpc=mpc)
 
     # When MPC is active, re-create u_field and lambda_field from the MPC's

@@ -167,6 +167,10 @@ def topopt(fem, opt, on_iteration=None, on_setup=None, on_finish=None):
         if opt_iter % opt["beta_interval"] == 0 and beta < opt["beta_max"]:
             beta *= 2
             change = opt["opt_tol"] * 2
+            # Proactively prepare the linear solver for the new, much sharper
+            # material contrast: force GAMG hierarchy rebuild + reset initial
+            # guess before the first solve with the new beta.
+            linear_problem.notify_beta_change(new_beta=beta)
         heaviside.forward(beta)
         stats.stop('filter')
 

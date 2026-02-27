@@ -69,7 +69,7 @@ def create_mechanism_vectors(func_space, in_spring, out_spring, dof_coords=None)
 
 
 class LinearProblem:
-    def __init__(self, u, lam, lhs, rhs, l_vec, spring_vec, bcs=[], petsc_options={}, gpu_accel=False, mpc=None):
+    def __init__(self, u, lam, lhs, rhs, l_vec, spring_vec, bcs=[], petsc_options={}, mpc=None):
         """Initialize a linear problem.
 
         Parameters
@@ -108,16 +108,42 @@ class LinearProblem:
         prefix = f"linear_solver_{id(self)}"
         self.solver.setOptionsPrefix(prefix)
 
-        # Apply PETSc options
+        # ── GAMG defaults for high-contrast topology optimization ──
+        # When β doubles (Heaviside sharpening), material contrast jumps and
+        # default GAMG settings (V-cycle, 0 agg smooths, threshold 0) produce
+        # poor coarse-grid operators → KSP iterations explode.
+        # These defaults are the standard recipe for SIMP-based topology
+        # optimization and can be overridden by explicit user petsc_options.
+        _gamg_topo_defaults = {}
+        if petsc_options.get("pc_type") == "gamg":
+            _gamg_topo_defaults = {
+                "pc_gamg_agg_nsmooths": 1,    # smoother aggregation (default 0)
+                "pc_gamg_threshold": 0.02,     # less aggressive coarsening
+                "mg_levels_ksp_max_it": 2,     # extra smoother sweeps per level
+                "pc_mg_cycle_type": "w",          # W-cycle for robustness
+                "ksp_max_it": 500,             # cap runaway solves (PETSc default 10000)
+            }
+
+        # Apply PETSc options (GAMG defaults first, then user options override)
         opts = PETSc.Options()
         opts.prefixPush(prefix)
+        for key, value in _gamg_topo_defaults.items():
+            if key not in petsc_options:
+                opts[key] = value
         for key, value in petsc_options.items():
             opts[key] = value
         opts.prefixPop()
         self.solver.setFromOptions()
-        # Only apply options to the matrix (not vectors — GPU types break ghost vectors)
         self.lhs_mat.setOptionsPrefix(prefix)
         self.lhs_mat.setFromOptions()
+
+        # Log GAMG topology-optimization defaults
+        if _gamg_topo_defaults:
+            applied = {k: v for k, v in _gamg_topo_defaults.items()
+                       if k not in petsc_options}
+            if applied and self.u.function_space.mesh.comm.rank == 0:
+                items = ", ".join(f"{k}={v}" for k, v in applied.items())
+                print(f"  🔧 GAMG high-contrast defaults: {items}", flush=True)
 
         # For iterative solvers (CG, GMRES, etc.), enable warm-starting from
         # the previous solution.  In topology optimization the design changes
@@ -126,34 +152,28 @@ class LinearProblem:
         self._iterative = petsc_options.get("ksp_type", "preonly") != "preonly"
         if self._iterative:
             self.solver.setInitialGuessNonzero(True)
+
+            # ── Near-nullspace for GAMG ──
+            # Elasticity problems have 6 near-kernel modes (3D) or 3 (2D):
+            # translations + rotations.  GAMG *requires* this information to
+            # build a good coarsening hierarchy — without it, convergence
+            # degrades catastrophically as material contrast grows.
+            if petsc_options.get("pc_type") == "gamg":
+                self._set_near_nullspace()
+
         self._first_solve = True
 
-        # GPU acceleration (opt-in via --gpu flag)
-        self.use_gpu = False
-        self._gpu_active = False
-        self._gpu_diag = None
-        self._gpu_mat_obj = None
-        if gpu_accel:
-            try:
-                # Test if HIP sparse matrices are supported
-                test_mat = PETSc.Mat().create(self.u.function_space.mesh.comm)
-                test_mat.setType("aijhipsparse")
-                test_mat.setSizes([10, 10])
-                test_mat.setUp()
-                test_mat.assemble()
-                test_mat.destroy()
-                self.use_gpu = True
-                # Override PC: GAMG/Hypre/SOR are all incompatible with aijhipsparse
-                # Jacobi (diagonal scaling) is the only working preconditioner
-                pc = self.solver.getPC()
-                pc.setType("jacobi")
-                self.solver.setTolerances(max_it=5000)
-                if self.u.function_space.mesh.comm.rank == 0:
-                    print("  🚀 HIP GPU acceleration enabled (PC: Jacobi)")
-            except Exception as e:
-                if self.u.function_space.mesh.comm.rank == 0:
-                    print(f"  ⚠️  GPU requested but HIP not available, falling back to CPU")
-                    print(f"      Reason: {type(e).__name__}: {e}")
+        # GAMG hierarchy rebuild tracking: detect KSP iteration spikes and
+        # monitor convergence failures to trigger proactive rebuilds.
+        self._ksp_history = []          # all recent KSP iteration counts
+        self._ksp_healthy = []          # only non-spike iterations (for clean baseline)
+        self._ksp_baseline = None       # average KSP iters from healthy solves
+        self._GAMG_REBUILD_FACTOR = 3.0 # rebuild when current > factor × baseline
+        self._beta_changed = False      # set by notify_beta_change()
+        self._consecutive_spikes = 0    # count consecutive spike/diverge solves
+        self._REGIME_SHIFT_THRESHOLD = 5  # after this many consecutive spikes, accept new regime
+        self._spike_logged = False      # rate-limit log spam (log once per spike series)
+
 
         assemble_vector(self.rhs_vec, self.rhs_form)
         if self.mpc is not None:
@@ -162,55 +182,232 @@ class LinearProblem:
         self.rhs_vec.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
         set_bc(self.rhs_vec, self.bcs)
 
+    def _set_near_nullspace(self):
+        """Set the near-nullspace (rigid body modes) on the matrix for GAMG.
+
+        For 3D elasticity: 6 modes (3 translations + 3 rotations).
+        For 2D elasticity: 3 modes (2 translations + 1 rotation).
+
+        This dramatically improves GAMG coarsening quality for elasticity
+        problems, especially at high material contrast (late topology
+        optimization iterations).
+        """
+        V = self.u.function_space
+        dim = V.mesh.geometry.dim
+        bs = V.dofmap.index_map_bs
+        num_local = V.dofmap.index_map.size_local
+
+        # Tabulate DOF coordinates (only owned DOFs)
+        coords = V.tabulate_dof_coordinates()[:num_local]
+
+        def _make_vec(values_per_node):
+            """Create a PETSc Vec and fill it from (num_local, bs) array."""
+            vec = self.lhs_mat.createVecLeft()
+            arr = vec.getArray(readonly=False)
+            arr[:num_local * bs] = values_per_node.ravel()
+            return vec
+
+        modes = []
+        if dim == 3:
+            x, y, z = coords[:, 0], coords[:, 1], coords[:, 2]
+            zero = np.zeros(num_local)
+            one = np.ones(num_local)
+            # Translations: Tx, Ty, Tz
+            modes.append(_make_vec(np.column_stack([one, zero, zero])))
+            modes.append(_make_vec(np.column_stack([zero, one, zero])))
+            modes.append(_make_vec(np.column_stack([zero, zero, one])))
+            # Rotations: Rx=(0,-z,y), Ry=(z,0,-x), Rz=(-y,x,0)
+            modes.append(_make_vec(np.column_stack([zero, -z, y])))
+            modes.append(_make_vec(np.column_stack([z, zero, -x])))
+            modes.append(_make_vec(np.column_stack([-y, x, zero])))
+        else:
+            x, y = coords[:, 0], coords[:, 1]
+            zero = np.zeros(num_local)
+            one = np.ones(num_local)
+            # Translations: Tx, Ty
+            modes.append(_make_vec(np.column_stack([one, zero])))
+            modes.append(_make_vec(np.column_stack([zero, one])))
+            # Rotation: Rz=(-y, x)
+            modes.append(_make_vec(np.column_stack([-y, x])))
+
+        # Orthonormalize the modes
+        for i, vi in enumerate(modes):
+            for vj in modes[:i]:
+                vi.axpy(-vi.dot(vj), vj)
+            norm = vi.norm()
+            if norm > 1e-10:
+                vi.scale(1.0 / norm)
+
+        nsp = PETSc.NullSpace().create(vectors=modes, comm=V.mesh.comm)
+        self.lhs_mat.setNearNullSpace(nsp)
+
+    def notify_beta_change(self, new_beta=None):
+        """Proactively prepare solver for a Heaviside beta change.
+
+        Must be called *before* the next solve_fem() after beta doubles.
+        This forces a full GAMG hierarchy rebuild, zeros the initial guess
+        (the old displacement reflects a smoother material distribution and
+        misleads the Krylov solver), and resets the KSP baseline tracking
+        so the new beta regime establishes its own clean baseline.
+
+        Parameters
+        ----------
+        new_beta : float, optional
+            The new beta value (for logging only).
+        """
+        if not self._iterative:
+            return
+
+        comm = self.u.function_space.mesh.comm
+
+        # Force full GAMG hierarchy rebuild on next solve
+        self._first_solve = True
+        self._beta_changed = True
+
+        # Zero the initial guess — the old displacement field reflects a
+        # smoother density distribution and is a poor starting point for
+        # the much sharper system.
+        self.u_wrap.set(0.0)
+        self.lam_wrap.set(0.0)
+
+        # Reset KSP baseline tracking for the new beta regime.
+        # Keep the last few healthy counts as a reference floor but clear
+        # the spike history so the new regime builds its own baseline.
+        self._ksp_history.clear()
+        self._ksp_healthy.clear()
+        self._ksp_baseline = None
+        self._consecutive_spikes = 0
+        self._spike_logged = False
+
+        if comm.rank == 0:
+            beta_str = f" (β={new_beta})" if new_beta is not None else ""
+            print(f"  🔄 Beta change{beta_str}: forcing GAMG rebuild + "
+                  f"initial-guess reset.", flush=True)
+
     def solve_fem(self):
         """Solve K*x=F for FEM."""
+        comm = self.u.function_space.mesh.comm
         from fenitop.timing import stats
-        
+
         stats.start('assembly')
-        # Restore CPU type for assembly (if GPU mode changed it last iteration)
-        if self.use_gpu and self._gpu_active:
-            self.lhs_mat.setType("aij")
         self.lhs_mat.zeroEntries()
         if self.mpc is not None:
             self._dmpc.assemble_matrix(self.lhs_form, self.mpc,
                                        bcs=self.bcs, A=self.lhs_mat)
         else:
             assemble_matrix(self.lhs_mat, self.lhs_form, bcs=self.bcs)
+
         self.lhs_mat.assemble()
+
         if self.spring_vec_wrap is not None:
             self.lhs_mat.setDiagonal(self.lhs_mat.getDiagonal() + self.spring_vec)
-        
+
         # For iterative solvers: after the first solve, tell PETSc the
         # sparsity pattern hasn't changed so GAMG/AMG can reuse the
         # coarsening hierarchy and only recompute the smoother weights.
         if self._iterative and not self._first_solve:
             self.solver.setOperators(self.lhs_mat, self.lhs_mat)
         self._first_solve = False
-
-        if self.use_gpu:
-            comm = self.u.function_space.mesh.comm
-            # Get diagonal for Jacobi BEFORE switching to GPU type
-            self._gpu_diag = self.lhs_mat.getDiagonal()
-            
-            if self._gpu_mat_obj is None:
-                self._gpu_mat_obj = self.lhs_mat.convert("aijhipsparse")
-            else:
-                self.lhs_mat.copy(self._gpu_mat_obj, structure=PETSc.Mat.Structure.SAME_NONZERO_PATTERN)
-            
-            self._gpu_mat_obj.assemble()
-            self._gpu_active = True
         stats.stop('assembly')
-        
+
         # The rhs_vec is already assembled in __init__
         set_bc(self.rhs_vec, self.bcs)
-        
+
         stats.start('solve')
-        if self.use_gpu:
-            self._solve_cg_gpu(self.rhs_vec, self.u_wrap)
-        else:
-            self.solver.solve(self.rhs_vec, self.u_wrap)
+        self.solver.solve(self.rhs_vec, self.u_wrap)
         stats.stop('solve')
-        
+
+        # ── GAMG hierarchy rebuild heuristic ──
+        # Track KSP iteration counts and convergence status.  Two triggers
+        # can force a full GAMG hierarchy rebuild on the next iteration:
+        #   1. KSP iterations spike beyond 3× the healthy baseline
+        #   2. KSP diverged (negative converged reason)
+        # The baseline is computed ONLY from non-spike solves to prevent
+        # poisoning — UNLESS we detect a regime shift (many consecutive
+        # spikes), in which case we accept the new iteration level as the
+        # new normal.
+        if self._iterative:
+            ksp_its = self.solver.getIterationNumber()
+            ksp_reason = self.solver.getConvergedReason()
+            self._ksp_history.append(ksp_its)
+            # Keep bounded (need at least _REGIME_SHIFT_THRESHOLD entries)
+            if len(self._ksp_history) > 20:
+                self._ksp_history = self._ksp_history[-20:]
+
+            # Check for divergence (negative reason = KSP_DIVERGED_*)
+            diverged = ksp_reason < 0
+
+            # Build or check baseline
+            is_spike = False
+            if self._ksp_baseline is None:
+                # Still building baseline from first 5 solves.
+                # Include diverged solves too — if the very first solves
+                # after a beta change diverge, we still need a baseline.
+                self._ksp_healthy.append(ksp_its)
+                if len(self._ksp_healthy) >= 5:
+                    self._ksp_baseline = (sum(self._ksp_healthy)
+                                          / len(self._ksp_healthy))
+            else:
+                threshold = self._GAMG_REBUILD_FACTOR * self._ksp_baseline
+                is_spike = ksp_its > threshold or diverged
+
+                if is_spike:
+                    self._consecutive_spikes += 1
+
+                    # ── Regime shift detection ──
+                    # After N consecutive spikes, the old baseline is stale.
+                    # Accept the recent iteration counts as the new regime.
+                    if (self._consecutive_spikes
+                            >= self._REGIME_SHIFT_THRESHOLD):
+                        recent = sorted(self._ksp_history[-self._REGIME_SHIFT_THRESHOLD:])
+                        new_baseline = recent[len(recent) // 2]  # median
+                        if (comm.rank == 0
+                                and abs(new_baseline - self._ksp_baseline) > 1):
+                            print(f"  📊 Regime shift: {self._consecutive_spikes} "
+                                  f"consecutive high-iter solves.  Baseline "
+                                  f"{self._ksp_baseline:.0f} → {new_baseline} "
+                                  f"(accepting new level).", flush=True)
+                        self._ksp_baseline = new_baseline
+                        self._ksp_healthy = list(
+                            self._ksp_history[-self._REGIME_SHIFT_THRESHOLD:])
+                        self._consecutive_spikes = 0
+                        self._spike_logged = False
+                        # No rebuild — we already tried, the system is just
+                        # harder now.  Let it converge at the higher iter count.
+                        is_spike = False
+                    else:
+                        # Log once per spike series, not every iteration
+                        if not self._spike_logged and comm.rank == 0:
+                            if diverged:
+                                print(f"  ⚠️  KSP diverged: reason={ksp_reason}, "
+                                      f"iters={ksp_its}.  Rebuilding hierarchy.",
+                                      flush=True)
+                            else:
+                                print(f"  ⚠️  KSP spike: {ksp_its} iters > "
+                                      f"{self._GAMG_REBUILD_FACTOR:.0f}× baseline "
+                                      f"({self._ksp_baseline:.0f}).  Rebuilding "
+                                      f"preconditioner hierarchy.", flush=True)
+                            self._spike_logged = True
+                else:
+                    # Healthy solve — update baseline and reset spike counter
+                    self._consecutive_spikes = 0
+                    self._spike_logged = False
+                    self._ksp_healthy.append(ksp_its)
+                    # Rolling window of last 10 healthy solves
+                    if len(self._ksp_healthy) > 10:
+                        self._ksp_healthy = self._ksp_healthy[-10:]
+                    self._ksp_baseline = (sum(self._ksp_healthy)
+                                          / len(self._ksp_healthy))
+
+            # Trigger rebuild only on first 2 spikes of a series.
+            # After that, rebuilding doesn't help — the matrix is just
+            # harder at this contrast level.
+            if is_spike and self._consecutive_spikes <= 2:
+                self._first_solve = True
+
+            # Clear beta_changed flag after first post-beta solve
+            self._beta_changed = False
+
         # MPC: recover slave DOF values from the reduced solution.
         # scatter_forward() BEFORE backsubstitution ensures ghost master
         # DOF values are up-to-date on ranks that own slave DOFs — without
@@ -219,92 +416,13 @@ class LinearProblem:
             self.u.x.scatter_forward()
             self.mpc.backsubstitution(self.u)
         self.u.x.scatter_forward()
-    
-    def _solve_cg_gpu(self, b, x, rtol=1e-8, max_it=5000):
-        """Manual PCG: GPU SpMV (explicit p_gpu sync) + CPU Jacobi."""
-        comm = self.u.function_space.mesh.comm
-        # Jacobi preconditioner from pre-extracted diagonal
-        diag_arr = self._gpu_diag.getArray().copy()
-        diag_arr[np.abs(diag_arr) < 1e-30] = 1.0
-        inv_diag = 1.0 / diag_arr
-        
-        b_norm = b.norm()
-        if b_norm == 0.0:
-            b_norm = 1.0
-        
-        # GPU workspace vectors (compatible with _gpu_mat_obj type)
-        p_gpu = self._gpu_mat_obj.createVecRight()
-        Ax_gpu = self._gpu_mat_obj.createVecLeft()
-        # CPU scratch vector (standard type)
-        Ax = b.duplicate()
-        
-        # Initial residual calculation: r = b - A*x
-        if x.norm() > 1e-15:
-            # Explicitly sync to GPU for mult (safer than relying on PETSc auto-sync)
-            x.copy(p_gpu)
-            self._gpu_mat_obj.mult(p_gpu, Ax_gpu)
-            Ax_gpu.copy(Ax)
-            r = b.copy()
-            r.axpy(-1.0, Ax)
-        else:
-            r = b.copy()
-        
-        # z = M^{-1} * r (on CPU)
-        z = r.duplicate()
-        z.getArray()[:] = r.getArray() * inv_diag
-        
-        p = z.copy()
-        rz = r.dot(z)
-        
-        for it in range(max_it):
-            r_norm = r.norm()
-            if comm.rank == 0 and it % 1000 == 0 and it > 0:
-                print(f"  🔍 CG iter {it:4d}: r_norm/b_norm={r_norm/b_norm:.4e}")
-            
-            if r_norm / b_norm < rtol or it == max_it - 1:
-                if comm.rank == 0 and it > 50: # Only print if not trivial solve
-                    print(f"  🔍 CG {'Converged' if r_norm/b_norm < rtol else 'Reached Max It'} at iter {it}: r_norm/b_norm={r_norm/b_norm:.4e}")
-                break
-            
-            # Ap = A * p
-            p.copy(p_gpu) # CPU -> GPU
-            self._gpu_mat_obj.mult(p_gpu, Ax_gpu)
-            Ax_gpu.copy(Ax) # GPU -> CPU
-            
-            pAp = p.dot(Ax)
-            if abs(pAp) < 1e-30:
-                if comm.rank == 0:
-                    print(f"  🔍 CG Breakdown at iter {it}: pAp={pAp:.4e}")
-                break
-            alpha = rz / pAp
-            
-            x.axpy(alpha, p)
-            r.axpy(-alpha, Ax)
-            
-            # z = M^{-1} * r
-            z.getArray()[:] = r.getArray() * inv_diag
-            
-            pAp_old = rz
-            rz = r.dot(z)
-            beta = rz / pAp_old
-            p.aypx(beta, z)
-        
-        p_gpu.destroy()
-        Ax_gpu.destroy()
-        Ax.destroy()
-        r.destroy()
-        z.destroy()
-        p.destroy()
 
     def solve_adjoint(self):
         """Solve K*lambda=-L for the adjoint equation."""
         from fenitop.timing import stats
         stats.start('solve')
         rhs = -self.l_vec
-        if self.use_gpu:
-            self._solve_cg_gpu(rhs, self.lam_wrap)
-        else:
-            self.solver.solve(rhs, self.lam_wrap)
+        self.solver.solve(rhs, self.lam_wrap)
         rhs.destroy()
         stats.stop('solve')
         # MPC: recover slave DOF values (same pattern as solve_fem)
@@ -319,10 +437,6 @@ class LinearProblem:
         self.rhs_vec.destroy()
         self.u_wrap.destroy()
         self.lam_wrap.destroy()
-        if self._gpu_diag is not None:
-            self._gpu_diag.destroy()
-        if self._gpu_mat_obj is not None:
-            self._gpu_mat_obj.destroy()
         if self.spring_vec_wrap is not None:
             self.spring_vec.destroy()
             self.l_vec.destroy()
