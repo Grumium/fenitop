@@ -99,7 +99,12 @@ class LinearProblem:
             import dolfinx_mpc as _dmpc
             self._dmpc = _dmpc
             # Use dolfinx_mpc to create the matrix with the correct sparsity
+            _comm = self.u.function_space.mesh.comm
+            if _comm.rank == 0:
+                print(f"  [LinearProblem] assembling MPC matrix ...", flush=True)
             self.lhs_mat = _dmpc.assemble_matrix(self.lhs_form, mpc, bcs=self.bcs)
+            if _comm.rank == 0:
+                print(f"  [LinearProblem] MPC matrix assembled", flush=True)
         else:
             self._dmpc = None
             self.lhs_mat = create_matrix(self.lhs_form)

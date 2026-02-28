@@ -125,7 +125,9 @@ def form_fem(fem, opt):
         except Exception as e:
             if mesh.comm.rank == 0:
                 print(f"  ⚠️  Failed to build MPC for diagonal symmetry: {e}")
+                import traceback; traceback.print_exc()
             mpc = None
+
 
 
 
