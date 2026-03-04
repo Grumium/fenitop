@@ -62,7 +62,11 @@ def form_fem(fem, opt):
     # Boundary conditions
     dim = mesh.topology.dim
     fdim = dim - 1
-    disp_facets = locate_entities_boundary(mesh, fdim, fem["disp_bc"])
+    disp_bc_fn = fem["disp_bc"]
+    if hasattr(disp_bc_fn, '_facet_indices') and disp_bc_fn._facet_indices:
+        disp_facets = np.array(sorted(disp_bc_fn._facet_indices), dtype=np.int32)
+    else:
+        disp_facets = locate_entities_boundary(mesh, fdim, disp_bc_fn)
     bc = dirichletbc(Constant(mesh, np.full(dim, 0.0)),
                      locate_dofs_topological(V, fdim, disp_facets), V)
 
@@ -135,7 +139,10 @@ def form_fem(fem, opt):
     for marker, (traction, traction_bc) in enumerate(fem["traction_bcs"]):
 
         tractions.append(Constant(mesh, np.array(traction, dtype=float)))
-        current_facets = locate_entities_boundary(mesh, fdim, traction_bc)
+        if hasattr(traction_bc, '_facet_indices') and traction_bc._facet_indices:
+            current_facets = np.array(sorted(traction_bc._facet_indices), dtype=np.int32)
+        else:
+            current_facets = locate_entities_boundary(mesh, fdim, traction_bc)
         facets.extend(current_facets)
         markers.extend([marker,]*len(current_facets))
     facets = np.array(facets, dtype=np.int32)
