@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fenitop"
+version = "1.1.0"
+description = "FEniCSx-based topology optimization engine (Topologui fork)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+
+# NOTE: dolfinx (>= 0.11), petsc4py and mpi4py are deliberately NOT listed.
+# They are not installable from PyPI and must be provided by the
+# environment (conda-forge or system packages) before installing this.
+# Listing them here would make `pip install .` fail on every machine.
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+]
+
+[project.optional-dependencies]
+# Multi-point constraints for diagonal / rotational symmetry (fenitop.mpc).
+# Also conda-only in practice: conda install -c conda-forge dolfinx_mpc
+mpc = []
+
+[tool.setuptools]
+packages = ["fenitop"]

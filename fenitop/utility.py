@@ -21,6 +21,7 @@ Reference:
 import os
 import numpy as np
 from scipy.spatial import cKDTree
+from mpi4py import MPI as _MPI
 from petsc4py import PETSc
 import dolfinx.io
 from dolfinx.fem import form, Function
@@ -72,6 +73,64 @@ def create_mechanism_vectors(func_space, in_spring, out_spring, dof_coords=None,
     return spring_vec_wrap, l_vec_wrap
 
 
+def petsc_has_package(name):
+    """True when this PETSc build provides *name* (mumps, hypre, superlu_dist).
+
+    Returns True when the question cannot be answered, so an old petsc4py
+    never blocks a solver that would in fact have worked.
+    """
+    try:
+        return bool(PETSc.Sys.hasExternalPackage(name))
+    except Exception:
+        return True
+
+
+#: Ordered fallbacks for solvers this PETSc build may not have been compiled
+#: with.  A stand-alone run against a cluster's PETSc module is the case that
+#: matters: without this, an unavailable package surfaces as an opaque error
+#: deep inside KSPSetUp, which is a poor way to lose an overnight job.
+_PC_FALLBACKS = {"hypre": ("gamg",)}
+_FACTOR_FALLBACKS = {"superlu_dist": ("mumps", "petsc"),
+                     "mumps": ("petsc",)}
+
+
+def resolve_petsc_options(petsc_options, comm=None):
+    """Downgrade solver choices this PETSc build cannot honour.
+
+    Returns a copy; the input is left alone.  Emits one line on rank 0 naming
+    the missing package and the fallback taken.  A no-op when everything the
+    caller asked for is available, so a fully-featured build behaves exactly as
+    before.
+    """
+    opts = dict(petsc_options)
+
+    def _note(msg):
+        if comm is None or comm.rank == 0:
+            print(f"  ⚠️  {msg}", flush=True)
+
+    pc = opts.get("pc_type")
+    if pc in _PC_FALLBACKS and not petsc_has_package(pc):
+        for cand in _PC_FALLBACKS[pc]:
+            if cand == "gamg" or petsc_has_package(cand):
+                _note(f"PETSc has no '{pc}'; falling back to pc_type={cand}.")
+                opts["pc_type"] = cand
+                break
+
+    factor = opts.get("pc_factor_mat_solver_type")
+    if factor and factor != "petsc" and not petsc_has_package(factor):
+        for cand in _FACTOR_FALLBACKS.get(factor, ("petsc",)):
+            if cand == "petsc" or petsc_has_package(cand):
+                _note(f"PETSc has no '{factor}'; falling back to "
+                      f"pc_factor_mat_solver_type={cand}.")
+                if cand == "petsc":
+                    opts.pop("pc_factor_mat_solver_type", None)
+                else:
+                    opts["pc_factor_mat_solver_type"] = cand
+                break
+
+    return opts
+
+
 class LinearProblem:
     def __init__(self, u, lam, lhs, rhs, l_vec, spring_vec, bcs=[], petsc_options={}, mpc=None):
         """Initialize a linear problem.
@@ -82,6 +141,11 @@ class LinearProblem:
             If provided, assembly and solve use dolfinx_mpc routines to
             enforce multi-point constraints (e.g. diagonal symmetry slip BCs).
         """
+        # Downgrade any solver this PETSc build was not compiled with, before
+        # the choice reaches KSPSetUp where it would fail opaquely.
+        petsc_options = resolve_petsc_options(
+            petsc_options, u.function_space.mesh.comm)
+
         # Initialization
         self.u, self.lam = u, lam
         self.u_wrap = self.u.x.petsc_vec
@@ -100,11 +164,22 @@ class LinearProblem:
             self._dmpc = _dmpc
             # Use dolfinx_mpc to create the matrix with the correct sparsity
             _comm = self.u.function_space.mesh.comm
-            if _comm.rank == 0:
-                print(f"  [LinearProblem] assembling MPC matrix ...", flush=True)
-            self.lhs_mat = _dmpc.assemble_matrix(self.lhs_form, mpc, bcs=self.bcs)
-            if _comm.rank == 0:
-                print(f"  [LinearProblem] MPC matrix assembled", flush=True)
+            # Allocate with the MPC sparsity pattern, but do NOT assemble:
+            # solve_fem() assembles on every call anyway, and the density has
+            # not been initialised yet at this point, so anything assembled
+            # here would be discarded unread.  dolfinx_mpc.assemble_matrix()
+            # allocates and assembles together, so reach for the allocate-only
+            # entry point it uses internally, falling back if it is not there.
+            try:
+                self.lhs_mat = _dmpc.cpp.mpc.create_matrix(
+                    self.lhs_form._cpp_object, mpc._cpp_object,
+                    mpc._cpp_object)
+            except AttributeError:
+                if _comm.rank == 0:
+                    print("  [LinearProblem] allocate-only MPC matrix "
+                          "unavailable; assembling instead", flush=True)
+                self.lhs_mat = _dmpc.assemble_matrix(
+                    self.lhs_form, mpc, bcs=self.bcs)
         else:
             self._dmpc = None
             self.lhs_mat = create_matrix(self.lhs_form)
@@ -123,9 +198,9 @@ class LinearProblem:
         # poor coarse-grid operators → KSP iterations explode.
         # These defaults are the standard recipe for SIMP-based topology
         # optimization and can be overridden by explicit user petsc_options.
-        _gamg_topo_defaults = {}
+        _pc_defaults = {}
         if petsc_options.get("pc_type") == "gamg":
-            _gamg_topo_defaults = {
+            _pc_defaults = {
                 "pc_gamg_agg_nsmooths": 1,    # smoother aggregation (default 0)
                 "pc_gamg_threshold": 0.02,     # less aggressive coarsening
                 "mg_levels_ksp_max_it": 2,     # extra smoother sweeps per level
@@ -133,10 +208,32 @@ class LinearProblem:
                 "ksp_max_it": 500,             # cap runaway solves (PETSc default 10000)
             }
 
-        # Apply PETSc options (GAMG defaults first, then user options override)
+        # ── hypre BoomerAMG defaults for elasticity ──
+        # BoomerAMG's scalar defaults ignore that our unknowns come in blocks
+        # of gdim displacement components per node.  Nodal coarsening plus
+        # interpolation that preserves the rigid-body modes is the elasticity
+        # recipe, and is hypre's counterpart to the near-nullspace we hand
+        # GAMG below.  Overridable by explicit user options, as with GAMG.
+        if petsc_options.get("pc_type") == "hypre":
+            # Measured on beam_3d, serial, against cg-gamg at 2.91 s/iter:
+            # plain BoomerAMG 19.2 (6.6x), these options 13.7 (4.5x), these
+            # options plus vec_interp_variant and a near-nullspace 47.8 (16x).
+            # So nodal coarsening earns its place and RBM-preserving
+            # interpolation does not.  hypre still loses to GAMG by 4.5x here
+            # and is deliberately NOT offered in the GUI solver menu; these
+            # defaults exist for anyone who selects it explicitly.
+            _pc_defaults = {
+                "pc_hypre_type": "boomeramg",
+                "pc_hypre_boomeramg_nodal_coarsen": 6,      # block coarsening
+                "pc_hypre_boomeramg_strong_threshold": 0.7,  # 3D elasticity
+                "pc_hypre_boomeramg_agg_nl": 1,
+                "ksp_max_it": 500,
+            }
+
+        # Apply PETSc options (solver defaults first, then user options override)
         opts = PETSc.Options()
         opts.prefixPush(prefix)
-        for key, value in _gamg_topo_defaults.items():
+        for key, value in _pc_defaults.items():
             if key not in petsc_options:
                 opts[key] = value
         for key, value in petsc_options.items():
@@ -146,13 +243,14 @@ class LinearProblem:
         self.lhs_mat.setOptionsPrefix(prefix)
         self.lhs_mat.setFromOptions()
 
-        # Log GAMG topology-optimization defaults
-        if _gamg_topo_defaults:
-            applied = {k: v for k, v in _gamg_topo_defaults.items()
+        # Log the preconditioner defaults that were actually applied
+        if _pc_defaults:
+            applied = {k: v for k, v in _pc_defaults.items()
                        if k not in petsc_options}
             if applied and self.u.function_space.mesh.comm.rank == 0:
                 items = ", ".join(f"{k}={v}" for k, v in applied.items())
-                print(f"  🔧 GAMG high-contrast defaults: {items}", flush=True)
+                _pc = petsc_options.get("pc_type", "?").upper()
+                print(f"  🔧 {_pc} high-contrast defaults: {items}", flush=True)
 
         # For iterative solvers (CG, GMRES, etc.), enable warm-starting from
         # the previous solution.  In topology optimization the design changes
@@ -167,10 +265,76 @@ class LinearProblem:
             # translations + rotations.  GAMG *requires* this information to
             # build a good coarsening hierarchy — without it, convergence
             # degrades catastrophically as material contrast grows.
+            #
+            # GAMG only, deliberately.  Handing the same modes to hypre via
+            # BoomerAMG's vec_interp_variant measured *worse*: beam_3d went
+            # from 13.7 to 47.8 s/iter.  Building interpolation that preserves
+            # six vectors is expensive setup, and topology optimization rebuilds
+            # the preconditioner every iteration (the density changes, so the
+            # matrix changes), so that setup is never amortized.
             if petsc_options.get("pc_type") == "gamg":
                 self._set_near_nullspace()
 
         self._first_solve = True
+
+        # Owned local row indices carrying a Dirichlet condition, cached for
+        # _rescale_bc_diagonal.  Ghost entries are dropped: the diagonal vector
+        # only covers owned rows.
+        _n_owned = (self.u.function_space.dofmap.index_map.size_local
+                    * self.u.function_space.dofmap.index_map_bs)
+        _idx = []
+        for _bc in self.bcs:
+            try:
+                _d, _ = _bc.dof_indices()
+                _idx.append(np.asarray(_d, dtype=np.int32))
+            except Exception:
+                pass
+        # dolfinx_mpc writes diagval=1 into slave rows exactly as dolfinx does
+        # for Dirichlet rows, so they need the same treatment.  Without this the
+        # MPC paths -- diagonal and C4 symmetry, which cannot be expressed as a
+        # plain Dirichlet condition -- keep the bad scaling: measured 63 Krylov
+        # iterations against 8 on beam_3d.
+        _mpc_slaves = np.empty(0, dtype=np.int32)
+        if mpc is not None:
+            try:
+                _mpc_slaves = np.asarray(mpc.slaves, dtype=np.int32)
+            except Exception as _exc:
+                if self.u.function_space.mesh.comm.rank == 0:
+                    print(f"  ⚠️  MPC slave rows not available for diagonal "
+                          f"rescaling: {_exc}", flush=True)
+        if _idx:
+            _all = np.unique(np.concatenate(_idx))
+            _all = _all[_all < _n_owned]
+            # Keep only *partially* constrained nodes.  A full clamp binds
+            # every component of its node, leaving a clean identity block that
+            # GAMG handles without complaint -- rescaling those rows costs
+            # time and buys nothing (beam_3d without symmetry: 9 Krylov
+            # iterations either way, but 5.6% slower).  The damage comes from
+            # a node with some components bound and others free, which is what
+            # a symmetry roller produces, and what leaves a mixed block that
+            # defeats block aggregation.
+            _bs = self.u.function_space.dofmap.index_map_bs
+            if _all.size and _bs > 1:
+                _nodes, _counts = np.unique(_all // _bs, return_counts=True)
+                _partial = set(_nodes[_counts < _bs].tolist())
+                _all = _all[[int(d) // _bs in _partial for d in _all]]
+        else:
+            _all = np.empty(0, dtype=np.int32)
+
+        # MPC slave rows bypass the test above.  A C4 constraint couples every
+        # component of its node, so the node looks "fully constrained" while
+        # being nothing like a clamp -- it is a coupling, not an identity
+        # block.  Measured no benefit on shell_3d, but the quadcopter with C4
+        # is unmeasured, so they stay in rather than be excluded on a guess.
+        _slaves = _mpc_slaves[_mpc_slaves < _n_owned]
+        if _slaves.size:
+            _all = np.unique(np.concatenate([_all, _slaves]))
+        self._bc_dof_indices = _all
+
+        # Decide once whether any rank has work to do, so an ordinary run pays
+        # nothing per solve.  Collective, hence outside the branch above.
+        self._needs_rescale = bool(self.u.function_space.mesh.comm.allreduce(
+            self._bc_dof_indices.size > 0, op=_MPI.LOR))
 
         # GAMG hierarchy rebuild tracking: detect KSP iteration spikes and
         # monitor convergence failures to trigger proactive rebuilds.
@@ -190,6 +354,59 @@ class LinearProblem:
                 self.rhs_vec, [self.lhs_form], [self.bcs], self.mpc)
         self.rhs_vec.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
         set_bc(self.rhs_vec, self.bcs)
+
+    def _rescale_bc_diagonal(self):
+        """Put the constrained rows on the same scale as the physical ones.
+
+        dolfinx writes 1.0 into constrained rows, but SIMP scales the physical
+        stiffness by rho^p, so the real diagonal sits near 1e-2 early on and
+        drifts over orders of magnitude as the density evolves.  That mismatch
+        wrecks GAMG's coarsening, and it gets worse the more of the boundary is
+        constrained: on a symmetry-reduced beam it cost **65** Krylov
+        iterations per solve instead of 8, which made exploiting symmetry
+        *slower* than solving the whole domain despite halving the mesh.
+
+        Every Dirichlet value here is zero, so ``set_bc`` writes 0 into the
+        right-hand side and the constrained unknown comes out 0 for any
+        non-zero diagonal.  The value is therefore free, and matching it to the
+        physical scale costs one O(n) pass over the diagonal.
+        """
+        # NOTE: the reduction below is collective, so every rank must reach it.
+        # Ranks owning no constrained rows still take part and contribute 0.0 --
+        # returning early here deadlocks, because whether a rank holds any
+        # Dirichlet dof depends on the partition.
+        diag = self.lhs_mat.getDiagonal()
+        arr = diag.array_w
+        idx = self._bc_dof_indices
+
+        local = 0.0
+        if arr.size:
+            mask = np.ones(arr.size, dtype=bool)
+            if idx.size:
+                mask[idx] = False
+            if mask.any():
+                local = float(np.median(np.abs(arr[mask])))
+
+        local_bc = 0.0
+        if idx.size:
+            local_bc = float(np.median(np.abs(arr[idx])))
+
+        comm = self.u.function_space.mesh.comm
+        scale = comm.allreduce(local, op=_MPI.MAX)
+        bc_scale = comm.allreduce(local_bc, op=_MPI.MAX)
+
+        # Only ever scale the constrained rows *down*.  A constrained diagonal
+        # far above the physical one breaks GAMG's aggregation -- that is the
+        # beam_3d case, 63 Krylov iterations against 8.  Far *below* is
+        # harmless and apparently even helpful: GAMG treats such a row as
+        # strongly constrained and leaves it out of the coarse space.  Raising
+        # it measurably hurt the quadcopter, whose E is 700x beam_3d's, at 10
+        # iterations against 11.5.  So this triggers on the damaging direction
+        # only.
+        if scale > 0.0 and idx.size and bc_scale > scale:
+            arr[idx] = scale
+            self.lhs_mat.setDiagonal(diag)
+        diag.destroy()
 
     def _set_near_nullspace(self):
         """Set the near-nullspace (rigid body modes) on the matrix for GAMG.
@@ -310,6 +527,9 @@ class LinearProblem:
 
         if self.spring_vec_wrap is not None:
             self.lhs_mat.setDiagonal(self.lhs_mat.getDiagonal() + self.spring_vec)
+
+        if self._needs_rescale:
+            self._rescale_bc_diagonal()
 
         # For iterative solvers: after the first solve, tell PETSc the
         # sparsity pattern hasn't changed so GAMG/AMG can reuse the
@@ -545,3 +765,58 @@ def save_xdmf(mesh, rho, path="", filename="optimized_design"):
         xdmf.write_mesh(mesh)
         rho.name = "density"
         xdmf.write_function(rho)
+
+
+def save_vtkhdf(mesh, rho, path="", filename="optimized_design", time=0.0):
+    """Write the design to VTKHDF, the format Kitware is standardising on.
+
+    Complements :func:`save_xdmf` rather than replacing it -- XDMF stays the
+    default because it is what the rest of the toolchain reads today.  VTKHDF
+    writes a single self-contained file (no .xdmf/.h5 pair), handles mixed
+    topology, and is the faster parallel writer.
+
+    Handles the two spaces the optimizer uses: CG1 (``rho_phys``) is written as
+    point data and DG0 (``rho``) as cell data.
+
+    Note:
+        ``write_point_data`` wants values ordered like the mesh *geometry
+        nodes*, which is not the function's dofmap order.  Writing
+        ``rho.x.array`` straight through produces a file that looks valid and
+        has the densities scrambled, so the values are permuted through the two
+        dofmaps below.
+    """
+    from dolfinx.io import vtkhdf
+
+    V = rho.function_space
+    family = V.ufl_element().family_name
+    degree = V.ufl_element().degree
+    save_path = os.path.join(path, f"{filename}.vtkhdf")
+
+    vtkhdf.write_mesh(save_path, mesh)
+
+    if degree == 0:
+        num_cells = mesh.topology.index_map(mesh.topology.dim).size_local
+        vtkhdf.write_cell_data(save_path, mesh,
+                               rho.x.array[:num_cells].copy(), time)
+        return save_path
+
+    if not (family in ("Lagrange", "P", "CG") and degree == 1):
+        raise ValueError(
+            f"save_vtkhdf supports DG0 and CG1 densities, got "
+            f"{family} degree {degree}.")
+
+    # Scatter the CG1 dof values into geometry-node positions.  For P1
+    # geometry both dofmaps have the same cell-local node ordering, so a
+    # cell-wise gather/scatter is an exact permutation.  Refresh ghost dofs
+    # first: a geometry node this rank owns can map to a dof it only ghosts,
+    # since the two index maps are built independently.
+    rho.x.scatter_forward()
+    geom_dofmap = mesh.geometry.dofmap.reshape(-1)
+    fn_dofmap = V.dofmap.list.reshape(-1)
+    values = np.zeros(mesh.geometry.x.shape[0], dtype=rho.x.array.dtype)
+    values[geom_dofmap] = rho.x.array[fn_dofmap]
+    # The writer takes owned entries only; geometry.x also carries ghosts,
+    # and owned nodes come first.
+    vtkhdf.write_point_data(
+        save_path, mesh, values[:mesh.geometry.index_map().size_local], time)
+    return save_path

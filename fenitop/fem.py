@@ -35,9 +35,9 @@ def form_fem(fem, opt):
     # Function spaces and functions
     mesh = fem["mesh"]
     dim = mesh.geometry.dim
-    V = functionspace(mesh, ("CG", 1, (dim,)))  # Vector function space
+    V = functionspace(mesh, ("Lagrange", 1, (dim,)))  # Vector function space
     S0 = functionspace(mesh, ("DG", 0))         # Scalar DG space
-    S = functionspace(mesh, ("CG", 1))          # Scalar CG space
+    S = functionspace(mesh, ("Lagrange", 1))    # Scalar CG space
 
     u, v = ufl.TrialFunction(V), ufl.TestFunction(V)
     u_field = Function(V)  # Displacement field
@@ -106,7 +106,7 @@ def form_fem(fem, opt):
     if rot_sym_bcs:
         # Rotational C4 (cyclic periodic) takes priority
         try:
-            from fenitop_gui.adapter.symmetry import build_mpc_cyclic_constraints
+            from fenitop.mpc import build_mpc_cyclic_constraints
             rot_data = rot_sym_bcs[0].get("rot_sym", rot_sym_bcs[0])
             mpc = build_mpc_cyclic_constraints(V, mesh, rot_data, bcs,
                                                owned_dof_coords=owned_dof_coords)
@@ -120,7 +120,7 @@ def form_fem(fem, opt):
             mpc = None
     elif diag_sym_bcs:
         try:
-            from fenitop_gui.adapter.symmetry import build_mpc_slip_constraints
+            from fenitop.mpc import build_mpc_slip_constraints
             mpc = build_mpc_slip_constraints(V, mesh, fem["symmetry_bcs"], bcs)
             if mpc is not None and mesh.comm.rank == 0:
                 print(f"  🔗 MPC slip constraint active "

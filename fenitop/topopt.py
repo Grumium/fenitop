@@ -28,7 +28,7 @@ from fenitop.fem import form_fem
 from fenitop.parameterize import DensityFilter, Heaviside
 from fenitop.sensitivity import Sensitivity
 from fenitop.optimize import optimality_criteria, mma_optimizer
-from fenitop.utility import Communicator, save_xdmf
+from fenitop.utility import Communicator, save_xdmf, save_vtkhdf
 
 
 def topopt(fem, opt, on_iteration=None, on_setup=None, on_finish=None):
@@ -297,25 +297,42 @@ def topopt(fem, opt, on_iteration=None, on_setup=None, on_finish=None):
         # When on_iteration is provided the caller manages its own output (e.g. GUI).
         if on_iteration is None:
             try:
-                from fenitop_gui.visualization.plotter import Plotter
+                from topologui.visualization.plotter import Plotter
                 plotter = Plotter(fem["mesh_serial"])
                 filename = opt.get("filename", "optimized_design")
                 print(f"\n📊 Creating JPG visualization...")
                 plotter.plot(physical_values, filename=filename)
                 print(f"✅ JPG visualization created: {filename}.jpg")
             except ImportError:
-                pass  # fenitop_gui not available (e.g. HPC / headless environment)
+                pass  # topologui not installed (e.g. HPC / headless environment)
             except Exception as e:
                 print(f"⚠️  Warning: Failed to create JPG visualization: {e}")
 
+            filename = opt.get("filename", "optimized_design")
+            rho_serial = None
             try:
-                filename = opt.get("filename", "optimized_design")
                 V_serial = dolfinx.fem.functionspace(fem["mesh_serial"], rho_phys_field.function_space.ufl_element())
                 rho_serial = dolfinx.fem.Function(V_serial)
                 rho_serial.x.array[:] = physical_values
-                save_xdmf(fem["mesh_serial"], rho_serial, filename=filename)
             except Exception as e:
-                print(f"⚠️  Warning: Failed to save XDMF: {e}")
+                print(f"⚠️  Warning: Failed to build serial density field: {e}")
+
+            if rho_serial is not None:
+                try:
+                    save_xdmf(fem["mesh_serial"], rho_serial, filename=filename)
+                except Exception as e:
+                    print(f"⚠️  Warning: Failed to save XDMF: {e}")
+
+                # Alongside, not instead of: XDMF stays what the rest of the
+                # toolchain reads, VTKHDF is the single-file format Kitware is
+                # standardising on.  Separately guarded so that losing it never
+                # looks like an XDMF failure.
+                if opt.get("save_vtkhdf", True):
+                    try:
+                        save_vtkhdf(fem["mesh_serial"], rho_serial,
+                                    filename=filename)
+                    except Exception as e:
+                        print(f"⚠️  Warning: Failed to save VTKHDF: {e}")
 
     # Call on_finish before returning — PETSc objects are still alive here.
     if on_finish is not None:
