@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """
 Authors:
 - Yingqi Jia (yingqij2@illinois.edu)
@@ -16,6 +17,12 @@ Reference:
   for 2D and 3D topology optimization supporting parallel computing.
   Struct Multidisc Optim 67, 140 (2024).
   https://doi.org/10.1007/s00158-024-03818-7
+
+Modified 2026 by Jan-David Förster for the TopoloGUI fork
+(https://github.com/Grumium/fenitop):
+NaN guard in the OC update, DOLFINx 0.11 port.
+Full list of deviations from upstream: CHANGES_FROM_FENITOP.md
+in https://github.com/Grumium/topologui
 """
 
 import numpy as np

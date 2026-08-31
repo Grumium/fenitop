@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """
 Authors:
 - Yingqi Jia (yingqij2@illinois.edu)
@@ -16,6 +17,13 @@ Reference:
   for 2D and 3D topology optimization supporting parallel computing.
   Struct Multidisc Optim 67, 140 (2024).
   https://doi.org/10.1007/s00158-024-03818-7
+
+Modified 2026 by Jan-David Förster for the TopoloGUI fork
+(https://github.com/Grumium/fenitop):
+on_setup/on_iteration/on_finish callbacks, resume support, phase timing,
+NaN detection, DOLFINx 0.11 port.
+Full list of deviations from upstream: CHANGES_FROM_FENITOP.md
+in https://github.com/Grumium/topologui
 """
 
 import time
@@ -300,7 +308,7 @@ def topopt(fem, opt, on_iteration=None, on_setup=None, on_finish=None):
                 from topologui.visualization.plotter import Plotter
                 plotter = Plotter(fem["mesh_serial"])
                 filename = opt.get("filename", "optimized_design")
-                print(f"\n📊 Creating JPG visualization...")
+                print("\n📊 Creating JPG visualization...")
                 plotter.plot(physical_values, filename=filename)
                 print(f"✅ JPG visualization created: {filename}.jpg")
             except ImportError:

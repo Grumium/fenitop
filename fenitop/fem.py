@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """
 Authors:
 - Yingqi Jia (yingqij2@illinois.edu)
@@ -16,6 +17,14 @@ Reference:
   for 2D and 3D topology optimization supporting parallel computing.
   Struct Multidisc Optim 67, 140 (2024).
   https://doi.org/10.1007/s00158-024-03818-7
+
+Modified 2026 by Jan-David Förster for the TopoloGUI fork
+(https://github.com/Grumium/fenitop):
+symmetry boundary conditions and MPC construction, objective scaling for
+symmetry-reduced domains, precomputed-facet BC locators, DOLFINx 0.11
+port.
+Full list of deviations from upstream: CHANGES_FROM_FENITOP.md
+in https://github.com/Grumium/topologui
 """
 
 import numpy as np
@@ -135,20 +144,43 @@ def form_fem(fem, opt):
 
 
 
-    tractions, facets, markers = [], [], []
-    for marker, (traction, traction_bc) in enumerate(fem["traction_bcs"]):
-
-        tractions.append(Constant(mesh, np.array(traction, dtype=float)))
+    # Accumulate the traction acting on each facet.  A facet can carry more
+    # than one traction -- two loads applied to the same face, or regions that
+    # overlap in part -- and they superpose, so the facet's load is their sum.
+    #
+    # meshtags needs one marker per facet, so the markers are assigned per
+    # distinct summed vector rather than per input traction.  Tagging by input
+    # instead, and dropping duplicate facets to satisfy meshtags, would keep
+    # whichever traction happened to be listed first and silently discard the
+    # rest.
+    facet_load = {}
+    for traction, traction_bc in fem["traction_bcs"]:
+        value = np.asarray(traction, dtype=float)
         if hasattr(traction_bc, '_facet_indices') and traction_bc._facet_indices is not None:
             current_facets = np.array(sorted(traction_bc._facet_indices), dtype=np.int32)
         else:
             current_facets = locate_entities_boundary(mesh, fdim, traction_bc)
-        facets.extend(current_facets)
-        markers.extend([marker,]*len(current_facets))
+        for f in current_facets:
+            f = int(f)
+            if f in facet_load:
+                facet_load[f] = facet_load[f] + value
+            else:
+                facet_load[f] = value.copy()
+
+    # Group facets by the load they carry.  Rounding keeps facets that differ
+    # only by floating-point noise in one group instead of one group each.
+    groups = {}
+    for f, value in facet_load.items():
+        groups.setdefault(tuple(np.round(value, 12)), []).append(f)
+
+    tractions, facets, markers = [], [], []
+    for marker, (value, group_facets) in enumerate(groups.items()):
+        tractions.append(Constant(mesh, np.array(value, dtype=float)))
+        facets.extend(group_facets)
+        markers.extend([marker] * len(group_facets))
+
     facets = np.array(facets, dtype=np.int32)
     markers = np.array(markers, dtype=np.int32)
-    _, unique_indices = np.unique(facets, return_index=True)
-    facets, markers = facets[unique_indices], markers[unique_indices]
     sorted_indices = np.argsort(facets)
     facet_tags = meshtags(mesh, fdim, facets[sorted_indices], markers[sorted_indices])
 

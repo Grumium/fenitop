@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Jan-David Förster
+
 """
 FEniTop: FEniCSx-based Topology Optimization
 
