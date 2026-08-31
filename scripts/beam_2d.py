@@ -20,16 +20,19 @@ Reference:
 
 import numpy as np
 from mpi4py import MPI
-from dolfinx.mesh import create_rectangle, CellType
+from dolfinx.mesh import create_rectangle, CellType, GhostMode
+import dolfinx
 
 from fenitop.topopt import topopt
 
 
 mesh = create_rectangle(MPI.COMM_WORLD, [[0, 0], [60, 20]],
-                        [200, 60], CellType.quadrilateral)
+                        [200, 60], CellType.quadrilateral,
+                        ghost_mode=GhostMode.shared_facet)
 if MPI.COMM_WORLD.rank == 0:
     mesh_serial = create_rectangle(MPI.COMM_SELF, [[0, 0], [60, 20]],
-                                   [200, 60], CellType.quadrilateral)
+                                   [200, 60], CellType.quadrilateral,
+                                   ghost_mode=GhostMode.shared_facet)
 else:
     mesh_serial = None
 
