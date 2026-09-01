@@ -141,7 +141,8 @@ def resolve_petsc_options(petsc_options, comm=None):
 
 
 class LinearProblem:
-    def __init__(self, u, lam, lhs, rhs, l_vec, spring_vec, bcs=[], petsc_options={}, mpc=None):
+    def __init__(self, u, lam, lhs, rhs, l_vec, spring_vec, bcs=[], petsc_options={},
+                 mpc=None, direction_rhs=None):
         """Initialize a linear problem.
 
         Parameters
@@ -149,6 +150,12 @@ class LinearProblem:
         mpc : dolfinx_mpc.MultiPointConstraint, optional
             If provided, assembly and solve use dolfinx_mpc routines to
             enforce multi-point constraints (e.g. diagonal symmetry slip BCs).
+        direction_rhs : list of ufl.Form, optional
+            Extra right-hand sides for a direction-uncertain load, one per
+            spatial direction.  They are solved alongside the main one in
+            solve_fem() and land in `self.u_dir`.  Each costs one more Krylov
+            solve or back-substitution, not another assembly or factorization:
+            the operator is shared, only the load differs.
         """
         # Downgrade any solver this PETSc build was not compiled with, before
         # the choice reaches KSPSetUp where it would fail opaquely.
@@ -194,6 +201,14 @@ class LinearProblem:
             self.lhs_mat = create_matrix(self.lhs_form)
 
         self.rhs_vec = create_vector(self.rhs_form.function_spaces[0])
+
+        # Direction basis: one assembled load vector and one solution vector
+        # per direction.  The loads do not depend on the density, so like
+        # rhs_vec they are assembled once, below.
+        self.direction_forms = [form(r) for r in (direction_rhs or [])]
+        self.rhs_dir = [create_vector(f.function_spaces[0])
+                        for f in self.direction_forms]
+        self.u_dir = [self.u_wrap.copy() for _ in self.direction_forms]
 
         # Construct a linear solver
         self.solver = PETSc.KSP().create(self.u.function_space.mesh.comm)
@@ -363,6 +378,13 @@ class LinearProblem:
                 self.rhs_vec, [self.lhs_form], [self.bcs], self.mpc)
         self.rhs_vec.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
         set_bc(self.rhs_vec, self.bcs)
+
+        for vec, frm in zip(self.rhs_dir, self.direction_forms):
+            assemble_vector(vec, frm)
+            if self.mpc is not None:
+                self._dmpc.apply_lifting(vec, [self.lhs_form], [self.bcs], self.mpc)
+            vec.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
+            set_bc(vec, self.bcs)
 
     def _rescale_bc_diagonal(self):
         """Put the constrained rows on the same scale as the physical ones.
@@ -552,7 +574,20 @@ class LinearProblem:
         set_bc(self.rhs_vec, self.bcs)
 
         stats.start('solve')
-        self.solver.solve(self.rhs_vec, self.u_wrap)
+        if self.rhs_dir:
+            # Direction-uncertain load: the basis solves below span every load
+            # direction, the nominal one included, so solving rhs_vec as well
+            # would be a wasted solve per iteration.  They share the operator,
+            # hence the factorization or preconditioner, and cost only a
+            # back-substitution or a Krylov run each.
+            for vec, u_k in zip(self.rhs_dir, self.u_dir):
+                set_bc(vec, self.bcs)
+                self.solver.solve(vec, u_k)
+            # Keep u_field a valid field: Sensitivity replaces it with the
+            # worst-case combination, but callbacks may read it before that.
+            self.u_dir[0].copy(self.u_wrap)
+        else:
+            self.solver.solve(self.rhs_vec, self.u_wrap)
         stats.stop('solve')
 
         # ── GAMG hierarchy rebuild heuristic ──
@@ -673,6 +708,10 @@ class LinearProblem:
         self.solver.destroy()
         self.lhs_mat.destroy()
         self.rhs_vec.destroy()
+        for vec in getattr(self, "rhs_dir", []):
+            vec.destroy()
+        for vec in getattr(self, "u_dir", []):
+            vec.destroy()
         self.u_wrap.destroy()
         self.lam_wrap.destroy()
         if self.spring_vec_wrap is not None:

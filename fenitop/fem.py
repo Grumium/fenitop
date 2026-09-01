@@ -37,8 +37,85 @@ from fenitop.utility import create_mechanism_vectors
 from fenitop.utility import LinearProblem
 
 
+#: Which coordinate axes each admissible load plane is spanned by.
+PLANE_AXES = {"xy": (0, 1), "xz": (0, 2), "yz": (1, 2)}
+
+
+def direction_mode(fem):
+    """Normalize the load-direction setting to one of the supported modes.
+
+    ``"fixed"``        the load acts exactly as entered (the default)
+    ``"any"``          its direction is unknown, over every axis
+    ``"xy"``/``"xz"``/``"yz"``
+                       its direction stays in that coordinate plane
+
+    ``uncertain_direction: True`` is accepted as the older spelling of
+    ``"any"``.
+    """
+    mode = fem.get("direction_mode")
+    if mode is None:
+        mode = "any" if fem.get("uncertain_direction") else "fixed"
+    mode = str(mode).lower()
+    if mode not in ("fixed", "any") and mode not in PLANE_AXES:
+        raise ValueError(
+            f"direction_mode must be 'fixed', 'any' or one of "
+            f"{sorted(PLANE_AXES)}, got {mode!r}.")
+    return mode
+
+
+def _check_uncertain_direction(fem, opt):
+    """Reject the combinations the worst-direction formulation cannot handle.
+
+    Checked before anything is assembled, so the reason is the first thing the
+    caller sees rather than a wrong result or a failure further in.  The
+    formulation resolves *the* load into a direction basis and reads the worst
+    case off a small compliance matrix; that argument needs the uncertain load
+    to be the only thing loading the structure.
+    """
+    mode = direction_mode(fem)
+    if mode == "fixed":
+        return
+    problems = []
+    gdim = fem["mesh"].geometry.dim
+    if mode in PLANE_AXES:
+        if max(PLANE_AXES[mode]) >= gdim:
+            problems.append(f"the {mode} plane needs a {max(PLANE_AXES[mode])+1}D "
+                            f"mesh, this one is {gdim}D")
+        eps = float(fem.get("transverse_ratio", 0.0))
+        if not 0.0 <= eps <= 1.0:
+            problems.append(f"transverse_ratio must be within [0, 1], got {eps}")
+        if len(fem["traction_bcs"]) == 1 and max(PLANE_AXES[mode]) < gdim:
+            value = np.asarray(fem["traction_bcs"][0][0], dtype=float)
+            out_of_plane = np.linalg.norm(
+                np.delete(value, list(PLANE_AXES[mode])))
+            in_plane = np.linalg.norm(value[list(PLANE_AXES[mode])])
+            if in_plane <= 0.0:
+                problems.append(f"the load has no component in the {mode} plane, "
+                                "so it has no main direction there")
+            elif out_of_plane > 1e-9 * max(np.linalg.norm(value), 1.0):
+                problems.append(
+                    f"the load must lie in the {mode} plane, but its "
+                    f"out-of-plane component is {out_of_plane:.3g} "
+                    f"against {in_plane:.3g} in plane")
+    if len(fem["traction_bcs"]) != 1:
+        problems.append("exactly one traction is required, found "
+                        f"{len(fem['traction_bcs'])}")
+    if np.any(np.asarray(fem["body_force"], dtype=float)):
+        problems.append("the body force must be zero")
+    if not opt["opt_compliance"]:
+        problems.append("the objective must be compliance")
+    if fem.get("symmetry_bcs"):
+        problems.append("symmetry planes cannot be exploited, because an "
+                        "uncertain load direction is not symmetric")
+    if problems:
+        raise ValueError(
+            f"direction_mode={mode!r} is limited to a single load carrying "
+            "the whole problem: " + "; ".join(problems) + ".")
+
+
 def form_fem(fem, opt):
     """Form an FEA problem."""
+    _check_uncertain_direction(fem, opt)
 
 
     # Function spaces and functions
@@ -196,6 +273,40 @@ def form_fem(fem, opt):
     rhs = ufl.dot(b, v)*dx
     for marker, t in enumerate(tractions):
         rhs += ufl.dot(t, v)*ds(marker)
+
+    # Direction-uncertain load: the single applied traction may act in any
+    # direction, and the structure has to carry the worst one.  Sampling angles
+    # is unnecessary -- the compliance is a quadratic form in the load
+    # direction, so the whole angular range is spanned by `dim` orthogonal
+    # basis loads of equal magnitude on the same facets.  Their solutions
+    # combine linearly into the response for any direction; see
+    # Sensitivity.evaluate().
+    opt["direction_rhs"] = None
+    opt["direction_mode"] = mode = direction_mode(fem)
+    opt["transverse_ratio"] = float(fem.get("transverse_ratio", 0.0))
+    if mode != "fixed":
+        gdim = mesh.geometry.dim
+        value = np.asarray(fem["traction_bcs"][0][0], dtype=float)
+        magnitude = float(np.linalg.norm(value))
+
+        if mode == "any":
+            # Every axis: the basis spans the whole sphere of directions.
+            directions = list(np.eye(gdim))
+        else:
+            # One coordinate plane, and inside it a basis aligned with the
+            # load rather than with the axes: the first vector is the load's
+            # own direction, so A[0,0] is the compliance of the load exactly
+            # as entered and the transverse ratio measures a perturbation
+            # against it.  The second spans what is left of the plane.
+            axes = PLANE_AXES[mode]
+            e_1, e_2 = np.zeros(gdim), np.zeros(gdim)
+            in_plane = value[list(axes)] / np.linalg.norm(value[list(axes)])
+            e_1[list(axes)] = in_plane
+            e_2[list(axes)] = (-in_plane[1], in_plane[0])
+            directions = [e_1, e_2]
+
+        opt["direction_rhs"] = [
+            ufl.dot(Constant(mesh, d*magnitude), v)*ds(0) for d in directions]
     if opt["opt_compliance"]:
         spring_vec = opt["l_vec"] = None
     else:
@@ -235,7 +346,7 @@ def form_fem(fem, opt):
 
     linear_problem = LinearProblem(u_field, lambda_field, lhs, rhs, opt["l_vec"],
                                    spring_vec, bcs, fem["petsc_options"],
-                                   mpc=mpc)
+                                   mpc=mpc, direction_rhs=opt["direction_rhs"])
 
     # When MPC is active, re-create u_field and lambda_field from the MPC's
     # function space.  After mpc.finalize(), the MPC replaces V's index map
@@ -275,6 +386,10 @@ def form_fem(fem, opt):
 
     opt["f_int"] = sym_factor * ufl.inner(sigma(u_field), epsilon(v))*dx
     opt["compliance"] = sym_factor * ufl.inner(sigma(u_field), epsilon(u_field))*dx
+    # The volume functional deliberately covers the whole mesh, passive zones
+    # included: vol_frac is a budget for the finished part, so material fixed
+    # into a solid zone spends from the same budget as the optimized structure
+    # around it, which then has to come out correspondingly leaner.
     opt["volume"] = rho_phys_field*dx
     opt["total_volume"] = Constant(mesh, 1.0)*dx
     opt["_sym_factor"] = sym_factor

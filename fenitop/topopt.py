@@ -31,6 +31,7 @@ import time
 import numpy as np
 from mpi4py import MPI
 import dolfinx.fem
+import dolfinx.la
 
 from fenitop.fem import form_fem
 from fenitop.parameterize import DensityFilter, Heaviside
@@ -81,6 +82,56 @@ def topopt(fem, opt, on_iteration=None, on_setup=None, on_finish=None):
 
     heaviside = Heaviside(rho_phys_field)
 
+    # ---- Passive zones -----------------------------------------------------
+    num_elems = rho_field.function_space.dofmap.index_map.size_local
+    centers = rho_field.function_space.tabulate_dof_coordinates()[:num_elems].T
+    solid, void = opt["solid_zone"](centers), opt["void_zone"](centers)
+
+    # Clamping the design variable (rho_min/rho_max, further down) is not
+    # enough on its own: the PDE filter averages a solid zone's 0.99 against
+    # the void beside it and the Heaviside projection then erodes that ~R-wide
+    # boundary layer, so the zone thins out exactly where the structure
+    # attaches to it.  Re-imposing the zones on the physical density inside the
+    # loop fixes that.  Switchable because it changes converged designs near
+    # the zones (identical objective, different local arrangement), so a run
+    # can still be reproduced against a pre-fix reference.
+    enforce_passive = bool(opt.get("enforce_passive_zones", True))
+    solid_nodes = void_nodes = None
+    num_nodes_owned = rho_phys_field.function_space.dofmap.index_map.size_local
+
+    if enforce_passive:
+        # The zones have to be expressed as node masks: the design variable rho
+        # lives in DG0 and rho_phys in CG1, so the cell masks above cannot index
+        # it.  Evaluating the zone predicate at the node coordinates would be
+        # the obvious route, but it disagrees with the cell mask at the rim --
+        # the nodal set reaches half a cell further into the design domain than
+        # the cells whose centroids are in the zone, which dilates every zone by
+        # that much.  So a node is taken to be in the zone only when *all* of
+        # its adjacent cells are, which agrees with the cell-level clamp.
+        S_node = rho_phys_field.function_space
+        mesh_t = fem["mesh"].topology
+        cell_nodes = np.asarray(S_node.dofmap.list)[:mesh_t.index_map(mesh_t.dim).size_local]
+
+        def _interior_nodes(cell_mask):
+            """Nodes every one of whose adjacent cells lies in the zone.
+
+            Counted through owned cells and reduced across ranks the way an
+            assembly is, so the mask does not depend on the partitioning: a
+            node on a rank boundary would otherwise look interior on the rank
+            that happens to hold only its zone-side cells.
+            """
+            total = dolfinx.fem.Function(S_node)
+            in_zone = dolfinx.fem.Function(S_node)
+            np.add.at(total.x.array, cell_nodes.ravel(), 1.0)
+            np.add.at(in_zone.x.array, cell_nodes[np.asarray(cell_mask, dtype=bool)].ravel(), 1.0)
+            for f in (total, in_zone):
+                f.x.scatter_reverse(dolfinx.la.InsertMode.add)
+                f.x.scatter_forward()
+            return (total.x.array > 0) & np.isclose(in_zone.x.array, total.x.array)
+
+        solid_nodes = _interior_nodes(solid)
+        void_nodes = _interior_nodes(void)
+
     sens_problem = Sensitivity(comm, opt, linear_problem, u_field, lambda_field, rho_phys_field)
     S_comm = Communicator(rho_field.function_space, fem["mesh_serial"])
     S_comm_phys = Communicator(rho_phys_field.function_space, fem["mesh_serial"])
@@ -95,16 +146,11 @@ def topopt(fem, opt, on_iteration=None, on_setup=None, on_finish=None):
 
 
     num_consts = 1 if opt["opt_compliance"] else 2
-    # Get owned DOFs only (not ghosts) for array sizing
-    num_elems = rho_field.function_space.dofmap.index_map.size_local
     if not opt["use_oc"]:
         rho_old1, rho_old2 = np.zeros(num_elems), np.zeros(num_elems)
         low, upp = None, None
 
-    # Apply passive zones
-    centers = rho_field.function_space.tabulate_dof_coordinates()[:num_elems].T
-
-    solid, void = opt["solid_zone"](centers), opt["void_zone"](centers)
+    # Apply passive zones (solid/void evaluated above, before Sensitivity)
     initial_rho = opt.get("initial_density")
     num_elems_global = rho_field.function_space.dofmap.index_map.size_global
     if initial_rho is not None:
@@ -181,6 +227,16 @@ def topopt(fem, opt, on_iteration=None, on_setup=None, on_finish=None):
             # guess before the first solve with the new beta.
             linear_problem.notify_beta_change(new_beta=beta)
         heaviside.forward(beta)
+
+        if enforce_passive:
+            # Hard-setting rho_phys makes drho vanish on those nodes, which is
+            # also the consistent derivative of this modified density map --
+            # zeroing it keeps the sensitivities exact rather than merely
+            # suppressing them.
+            rho_phys_field.x.array[solid_nodes] = 1.0
+            rho_phys_field.x.array[void_nodes] = 0.0
+            heaviside.drho[solid_nodes[:num_nodes_owned]] = 0.0
+            heaviside.drho[void_nodes[:num_nodes_owned]] = 0.0
         stats.stop('filter')
 
         # Solve FEM
