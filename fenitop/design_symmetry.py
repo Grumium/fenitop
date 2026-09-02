@@ -30,7 +30,7 @@ except ImportError:                 # pragma: no cover - scipy is a dependency
 
 
 def _plane_transforms(planes, gdim):
-    """Affine ``(R, t)`` maps for the planes worth mirroring about.
+    """Affine ``(R, t, name)`` maps for the planes worth mirroring about.
 
     Rotational symmetry is skipped: it comes with a quarter domain and a
     cyclic constraint of its own, so there is no full domain left to mirror.
@@ -45,8 +45,16 @@ def _plane_transforms(planes, gdim):
             if norm == 0.0:
                 continue
             normal = normal/norm
+            # Mirroring about {x : n.(x - p) = 0} is x -> R x + 2 (n.p) n.  The
+            # offset matters: detection places a diagonal plane through the
+            # bounding-box centre, and taking it through the origin instead
+            # mirrors a part that does not sit at the origin onto empty space.
+            point = np.asarray(plane.get("point", np.zeros(gdim)),
+                               dtype=float)[:gdim]
             transforms.append((np.eye(gdim) - 2.0*np.outer(normal, normal),
-                               np.zeros(gdim)))
+                               2.0*float(normal @ point)*normal,
+                               plane.get("name") or
+                               f"diagonal plane with normal {normal.round(3)}"))
         elif ptype == "axis_aligned":
             axis = {"x": 0, "y": 1, "z": 2}[plane["axis"]]
             if axis >= gdim:
@@ -55,7 +63,8 @@ def _plane_transforms(planes, gdim):
             R[axis, axis] = -1.0
             t = np.zeros(gdim)
             t[axis] = 2.0*float(plane["value"])
-            transforms.append((R, t))
+            transforms.append((R, t, plane.get("name") or
+                               f"{plane['axis']} = {plane['value']:g}"))
     return transforms
 
 
@@ -71,14 +80,23 @@ def _close_group(transforms, gdim, limit=16):
 
     def key(element):
         R, t = element
-        return (np.round(R, 9).tobytes(), np.round(t, 9).tobytes())
+        # ``+ 0.0`` turns -0.0 into 0.0.  Without it the identity reached by
+        # composing a mirror with itself is not recognized as the identity
+        # already in the set -- a mirror built as I - 2nn^T carries diagonal
+        # entries a whisker below zero, which square to a negative zero -- and
+        # the duplicate leaves the orbit average weighting one image twice.
+        # It is then not a projection, and the design does not come out
+        # symmetric: measured on a diagonal plane, a group of three where two
+        # was right, and a residual asymmetry of 0.72 instead of round-off.
+        return ((np.round(R, 9) + 0.0).tobytes(),
+                (np.round(t, 9) + 0.0).tobytes())
 
     seen = {key(group[0])}
     changed = True
     while changed and len(group) < limit:
         changed = False
         for R1, t1 in list(group):
-            for R2, t2 in transforms:
+            for R2, t2 in ((R, t) for R, t, _ in transforms):
                 candidate = (R2 @ R1, R2 @ t1 + t2)
                 if key(candidate) not in seen:
                     seen.add(key(candidate))
@@ -106,9 +124,6 @@ class DesignSymmetry:
         transforms = _plane_transforms(planes, gdim)
         if not transforms:
             return
-        group = _close_group(transforms, gdim)
-        if len(group) < 2:
-            return
 
         index_map = space.dofmap.index_map
         num_local = index_map.size_local
@@ -132,22 +147,56 @@ class DesignSymmetry:
         spacing, _ = tree.query(all_centroids, k=2)
         tol = 0.25*float(np.min(spacing[:, 1])) if num_global > 1 else 1e-12
 
-        rows, cols = [], []
-        weight = 1.0/len(group)
-        for R, t in group:
-            images = centroids @ R.T + t
-            distance, columns = tree.query(images, k=1)
+        def maps_onto_itself(R, t):
+            """Whether every cell has an image under this map, on every rank."""
+            distance, columns = tree.query(centroids @ R.T + t, k=1)
             far = distance > tol
-            if np.any(far):
-                worst = float(np.max(distance[far]))
+            local = (int(np.sum(far)), float(np.max(distance)) if far.any()
+                     else 0.0)
+            counts = comm.allreduce(local[0], op=MPI.SUM)
+            worst = comm.allreduce(local[1], op=MPI.MAX)
+            return counts == 0, counts, worst, columns
+
+        # A plane the mesh does not answer to is dropped, not fatal.  The
+        # usual reason is a second plane the run reduced the domain on: after
+        # halving, a plane whose normal is a different axis still maps what is
+        # left onto itself, but a diagonal one folds it off the mesh
+        # altogether.  Which of the two it is depends on the geometry, so it
+        # is settled by asking the mesh rather than by a rule.
+        usable = []
+        for R, t, name in transforms:
+            ok, count, worst, _ = maps_onto_itself(R, t)
+            if ok:
+                usable.append((R, t, name))
+            elif comm.rank == 0:
+                print(f"  ⚠️  Symmetric design about {name} skipped: "
+                      f"{count} cells have no mirror image on this mesh "
+                      f"(worst distance {worst:.3g}, tolerance {tol:.3g}).",
+                      flush=True)
+        if not usable:
+            return
+
+        # Compositions of maps that each send the mesh to itself do the same,
+        # so closing the group cannot introduce a new failure -- but the
+        # matches are found by proximity, so the assertion below is kept
+        # rather than assumed.
+        group = _close_group(usable, gdim)
+        if len(group) < 2:
+            return
+
+        rows, cols = [], []
+        for R, t in group:
+            ok, count, worst, columns = maps_onto_itself(R, t)
+            if not ok:
                 raise ValueError(
-                    "the mesh is not symmetric about the planes selected for "
-                    f"a symmetric design: {int(np.sum(far))} of {num_local} "
-                    f"cells have no mirror image within {tol:.3g} "
-                    f"(worst distance {worst:.3g}).")
+                    "the mesh is not symmetric about a combination of the "
+                    f"planes selected for a symmetric design: {count} cells "
+                    f"have no mirror image within {tol:.3g} (worst distance "
+                    f"{worst:.3g}).")
             rows.append(np.arange(num_local, dtype=np.int32)
                         + index_map.local_range[0])
             cols.append(columns.astype(np.int32))
+        weight = 1.0/len(group)
 
         mat = PETSc.Mat().createAIJ(
             size=((num_local, num_global), (num_local, num_global)),
