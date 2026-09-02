@@ -140,6 +140,338 @@ def resolve_petsc_options(petsc_options, comm=None):
     return opts
 
 
+def _solver_defaults(petsc_options):
+    """Preconditioner settings a topology optimization needs and PETSc's own
+    defaults do not provide.  Returned rather than applied, so the caller can
+    let explicit user options win and report only what it actually used.
+    """
+    if petsc_options.get("pc_type") == "gamg":
+        # When beta doubles (Heaviside sharpening), material contrast jumps
+        # and PETSc's GAMG defaults (V-cycle, 0 agg smooths, threshold 0)
+        # produce poor coarse-grid operators -> KSP iterations explode.  This
+        # is the standard recipe for SIMP-based topology optimization.
+        return {
+            "pc_gamg_agg_nsmooths": 1,     # smoother aggregation (default 0)
+            "pc_gamg_threshold": 0.02,     # less aggressive coarsening
+            "mg_levels_ksp_max_it": 2,     # extra smoother sweeps per level
+            "pc_mg_cycle_type": "w",       # W-cycle for robustness
+            "ksp_max_it": 500,             # cap runaway solves (default 10000)
+        }
+    if petsc_options.get("pc_type") == "hypre":
+        # BoomerAMG's scalar defaults ignore that our unknowns come in blocks
+        # of gdim displacement components per node.  Nodal coarsening plus
+        # interpolation that preserves the rigid-body modes is the elasticity
+        # recipe, and is hypre's counterpart to the near-nullspace handed to
+        # GAMG below.
+        #
+        # Measured on beam_3d, serial, against cg-gamg at 2.91 s/iter: plain
+        # BoomerAMG 19.2 (6.6x), these options 13.7 (4.5x), these options plus
+        # vec_interp_variant and a near-nullspace 47.8 (16x).  So nodal
+        # coarsening earns its place and RBM-preserving interpolation does
+        # not.  hypre still loses to GAMG by 4.5x here and is deliberately NOT
+        # offered in the GUI solver menu; these defaults exist for anyone who
+        # selects it explicitly.
+        return {
+            "pc_hypre_type": "boomeramg",
+            "pc_hypre_boomeramg_nodal_coarsen": 6,       # block coarsening
+            "pc_hypre_boomeramg_strong_threshold": 0.7,  # 3D elasticity
+            "pc_hypre_boomeramg_agg_nl": 1,
+            "ksp_max_it": 500,
+        }
+    return {}
+
+
+def _apply_solver_options(solver, mat, prefix, petsc_options, defaults):
+    """Push *defaults*, then *petsc_options* over them, under *prefix*."""
+    solver.setOptionsPrefix(prefix)
+    opts = PETSc.Options()
+    opts.prefixPush(prefix)
+    for key, value in defaults.items():
+        if key not in petsc_options:
+            opts[key] = value
+    for key, value in petsc_options.items():
+        opts[key] = value
+    opts.prefixPop()
+    solver.setFromOptions()
+    mat.setOptionsPrefix(prefix)
+    mat.setFromOptions()
+
+
+def _dirichlet_rows(bcs):
+    """Every local row the Dirichlet conditions in *bcs* hold at zero."""
+    indices = []
+    for bc in bcs:
+        try:
+            dofs, _ = bc.dof_indices()
+            indices.append(np.asarray(dofs, dtype=np.int32))
+        except Exception:
+            pass
+    return (np.unique(np.concatenate(indices)) if indices
+            else np.empty(0, dtype=np.int32))
+
+
+def _constrained_rows(bcs, func_space, mpc_slaves=None):
+    """Owned local rows whose diagonal `_rescale_constrained_rows` may touch.
+
+    Ghost entries are dropped: the diagonal vector only covers owned rows.
+    """
+    block_size = func_space.dofmap.index_map_bs
+    n_owned = func_space.dofmap.index_map.size_local*block_size
+
+    rows = _dirichlet_rows(bcs)
+    if rows.size:
+        rows = rows[rows < n_owned]
+        # Keep only *partially* constrained nodes.  A full clamp binds every
+        # component of its node, leaving a clean identity block that GAMG
+        # handles without complaint -- rescaling those rows costs time and
+        # buys nothing (beam_3d without symmetry: 9 Krylov iterations either
+        # way, but 5.6% slower).  The damage comes from a node with some
+        # components bound and others free, which is what a symmetry roller
+        # produces, and what leaves a mixed block that defeats block
+        # aggregation.
+        if rows.size and block_size > 1:
+            nodes, counts = np.unique(rows//block_size, return_counts=True)
+            partial = set(nodes[counts < block_size].tolist())
+            rows = rows[[int(d)//block_size in partial for d in rows]]
+
+    # MPC slave rows bypass the test above.  A C4 constraint couples every
+    # component of its node, so the node looks "fully constrained" while being
+    # nothing like a clamp -- it is a coupling, not an identity block.
+    # Measured no benefit on shell_3d, but the quadcopter with C4 is
+    # unmeasured, so they stay in rather than be excluded on a guess.
+    if mpc_slaves is not None:
+        slaves = np.asarray(mpc_slaves, dtype=np.int32)
+        slaves = slaves[slaves < n_owned]
+        if slaves.size:
+            rows = np.unique(np.concatenate([rows, slaves]))
+    return rows
+
+
+def _rescale_constrained_rows(mat, rows, comm):
+    """Put the constrained rows on the same scale as the physical ones.
+
+    dolfinx writes 1.0 into constrained rows, but SIMP scales the physical
+    stiffness by rho^p, so the real diagonal sits near 1e-2 early on and
+    drifts over orders of magnitude as the density evolves.  That mismatch
+    wrecks GAMG's coarsening, and it gets worse the more of the boundary is
+    constrained: on a symmetry-reduced beam it cost **65** Krylov iterations
+    per solve instead of 8, which made exploiting symmetry *slower* than
+    solving the whole domain despite halving the mesh.
+
+    Every Dirichlet value here is zero, so ``set_bc`` writes 0 into the
+    right-hand side and the constrained unknown comes out 0 for any non-zero
+    diagonal.  The value is therefore free, and matching it to the physical
+    scale costs one O(n) pass over the diagonal.
+    """
+    # NOTE: the reduction below is collective, so every rank must reach it.
+    # Ranks owning no constrained rows still take part and contribute 0.0 --
+    # returning early here deadlocks, because whether a rank holds any
+    # Dirichlet dof depends on the partition.
+    diag = mat.getDiagonal()
+    arr = diag.array_w
+
+    local = 0.0
+    if arr.size:
+        mask = np.ones(arr.size, dtype=bool)
+        if rows.size:
+            mask[rows] = False
+        if mask.any():
+            local = float(np.median(np.abs(arr[mask])))
+
+    local_bc = float(np.median(np.abs(arr[rows]))) if rows.size else 0.0
+
+    scale = comm.allreduce(local, op=_MPI.MAX)
+    bc_scale = comm.allreduce(local_bc, op=_MPI.MAX)
+
+    # Only ever scale the constrained rows *down*.  A constrained diagonal far
+    # above the physical one breaks GAMG's aggregation -- that is the beam_3d
+    # case, 63 Krylov iterations against 8.  Far *below* is harmless and
+    # apparently even helpful: GAMG treats such a row as strongly constrained
+    # and leaves it out of the coarse space.  Raising it measurably hurt the
+    # quadcopter, whose E is 700x beam_3d's, at 10 iterations against 11.5.
+    # So this triggers on the damaging direction only.
+    if scale > 0.0 and rows.size and bc_scale > scale:
+        arr[rows] = scale
+        mat.setDiagonal(diag)
+    diag.destroy()
+
+
+def _set_rigid_body_modes(mat, func_space, constrained=None):
+    """Set the near-nullspace (rigid body modes) on the matrix for GAMG.
+
+    For 3D elasticity: 6 modes (3 translations + 3 rotations).
+    For 2D elasticity: 3 modes (2 translations + 1 rotation).
+
+    GAMG *requires* this information to build a good coarsening hierarchy --
+    without it, convergence degrades catastrophically as material contrast
+    grows.
+
+    *constrained* lists the rows the Dirichlet conditions hold at zero, and
+    they are zeroed in every mode.  This matters: a near-nullspace vector has
+    to be one the operator *nearly annihilates*, and the constrained operator
+    does no such thing to a mode that moves the rows it pins.  A clamp on one
+    small face barely disturbs a rigid-body mode, but a symmetry roller pins
+    one component along a whole mirror plane and removes a translation
+    outright.  Handed the raw modes there, GAMG built its coarse space around
+    the wrong subspace: measured on a high-contrast half beam, CG stopped with
+    an indefinite preconditioner after six iterations and returned a field
+    with a relative residual of **11.7**, which nothing downstream checked --
+    the compliance came out 0.09% wrong at moderate contrast and 1.1% wrong at
+    high contrast, silently.  With the modes projected it agrees with a direct
+    solve to 5e-8.  A mode the constraints destroy entirely is dropped rather
+    than handed over as round-off.
+
+    GAMG only, deliberately.  Handing the same modes to hypre via BoomerAMG's
+    vec_interp_variant measured *worse*: beam_3d went from 13.7 to 47.8
+    s/iter.  Building interpolation that preserves six vectors is expensive
+    setup, and topology optimization rebuilds the preconditioner every
+    iteration (the density changes, so the matrix changes), so that setup is
+    never amortized.
+    """
+    dim = func_space.mesh.geometry.dim
+    bs = func_space.dofmap.index_map_bs
+    num_local = func_space.dofmap.index_map.size_local
+    coords = func_space.tabulate_dof_coordinates()[:num_local]
+
+    def _make_vec(values_per_node):
+        """Create a PETSc Vec and fill it from a (num_local, bs) array."""
+        vec = mat.createVecLeft()
+        arr = vec.getArray(readonly=False)
+        arr[:num_local*bs] = values_per_node.ravel()
+        return vec
+
+    rows = np.empty(0, dtype=np.int32)
+    if constrained is not None:
+        rows = np.asarray(constrained, dtype=np.int32)
+        rows = rows[rows < num_local*bs]
+
+    zero, one = np.zeros(num_local), np.ones(num_local)
+    modes = []
+    if dim == 3:
+        x, y, z = coords[:, 0], coords[:, 1], coords[:, 2]
+        # Translations: Tx, Ty, Tz
+        modes.append(_make_vec(np.column_stack([one, zero, zero])))
+        modes.append(_make_vec(np.column_stack([zero, one, zero])))
+        modes.append(_make_vec(np.column_stack([zero, zero, one])))
+        # Rotations: Rx=(0,-z,y), Ry=(z,0,-x), Rz=(-y,x,0)
+        modes.append(_make_vec(np.column_stack([zero, -z, y])))
+        modes.append(_make_vec(np.column_stack([z, zero, -x])))
+        modes.append(_make_vec(np.column_stack([-y, x, zero])))
+    else:
+        x, y = coords[:, 0], coords[:, 1]
+        # Translations: Tx, Ty
+        modes.append(_make_vec(np.column_stack([one, zero])))
+        modes.append(_make_vec(np.column_stack([zero, one])))
+        # Rotation: Rz=(-y, x)
+        modes.append(_make_vec(np.column_stack([-y, x])))
+
+    kept = []
+    for vi in modes:
+        if rows.size:
+            vi.getArray(readonly=False)[rows] = 0.0
+        full = vi.norm()
+        for vj in kept:
+            vi.axpy(-vi.dot(vj), vj)
+        norm = vi.norm()
+        # Dropped when the constraints leave nothing of the mode that the
+        # earlier ones do not already span -- keeping it would hand GAMG a
+        # direction made of round-off.
+        if norm > 1e-6*max(full, 1.0):
+            vi.scale(1.0/norm)
+            kept.append(vi)
+        else:
+            vi.destroy()
+
+    if kept:
+        mat.setNearNullSpace(PETSc.NullSpace().create(
+            vectors=kept, comm=func_space.mesh.comm))
+
+
+class _DivergenceFallback:
+    """Rescue a Krylov solve that stopped without converging.
+
+    A diverged KSP still writes something into the solution vector, and PETSc
+    reports the fact only through the converged reason -- which nothing
+    downstream inspects.  On a high-contrast design that silence is expensive:
+    measured on a half beam with rho clipped to 0.01, CG stopped with an
+    indefinite preconditioner after seven iterations and returned a field
+    whose relative residual was **199**, and the compliance built from it came
+    out 1.8% wrong with no indication that anything had happened.
+
+    So a failed solve is retried rather than believed.  First with the
+    preconditioner rebuilt from scratch and the guess reset -- an AMG
+    hierarchy carried over from an earlier density is the usual reason -- and
+    if that fails too, by factorizing the operator outright.  The direct solve
+    is slow, but it is once, and it is right.
+    """
+
+    def __init__(self, comm, label):
+        self.comm = comm
+        self.label = label
+        self.direct = None
+        self.reported = False
+
+    def solve(self, solver, mat, rhs, out):
+        solver.solve(rhs, out)
+        if solver.getConvergedReason() >= 0:
+            return
+        first = solver.getConvergedReason()
+
+        out.zeroEntries()
+        solver.getPC().reset()
+        solver.setOperators(mat, mat)
+        solver.solve(rhs, out)
+        if solver.getConvergedReason() >= 0:
+            self._report(f"the {self.label} solve stopped early (KSP reason "
+                         f"{first}); rebuilding the preconditioner recovered "
+                         f"it")
+            return
+        second = solver.getConvergedReason()
+
+        self._direct(mat).solve(rhs, out)
+        reason = self._direct(mat).getConvergedReason()
+        if reason < 0:
+            raise RuntimeError(
+                f"the {self.label} solve did not converge (KSP reason "
+                f"{first}, {second} after a preconditioner rebuild) and the "
+                f"direct fallback failed as well (reason {reason})")
+        self._report(f"the {self.label} solve stopped early (KSP reason "
+                     f"{first}, {second} after a preconditioner rebuild); "
+                     f"falling back to a direct solve, which is slower")
+
+    def _direct(self, mat):
+        """A factorizing solver for *mat*, built once and reused."""
+        if self.direct is None:
+            ksp = PETSc.KSP().create(self.comm)
+            ksp.setType("preonly")
+            pc = ksp.getPC()
+            pc.setType("lu")
+            for package in ("mumps", "superlu_dist"):
+                if petsc_has_package(package):
+                    pc.setFactorSolverType(package)
+                    break
+            else:
+                if self.comm.size > 1:
+                    raise RuntimeError(
+                        f"the {self.label} solve did not converge and this "
+                        "PETSc build has neither MUMPS nor SuperLU_DIST, so "
+                        "there is no direct fallback in parallel.  Rerun on "
+                        "one rank, or install one of them.")
+            self.direct = ksp
+        self.direct.setOperators(mat, mat)
+        return self.direct
+
+    def _report(self, message):
+        if not self.reported and self.comm.rank == 0:
+            print(f"  ⚠️  {message}.", flush=True)
+            self.reported = True
+
+    def destroy(self):
+        if self.direct is not None:
+            self.direct.destroy()
+            self.direct = None
+
+
 class _ParitySolver:
     """The same stiffness form under a different set of Dirichlet conditions.
 
@@ -148,26 +480,42 @@ class _ParitySolver:
     conditions clear, so it shares the form, the density and the mesh, and
     needs its own matrix, its own factorization and nothing else.
 
+    It needs everything LinearProblem does to make an iterative solve behave:
+    the preconditioner defaults, the rigid-body modes GAMG coarsens with, and
+    the rescaling of the constrained diagonal.  Without them a CG/GAMG run
+    stops with an indefinite preconditioner within a handful of iterations --
+    and this operator is the more exposed of the two, because an antisymmetric
+    class pins every component on the mirror plane *but* the normal one, so
+    the whole plane carries the partially constrained node pattern that
+    defeats block aggregation.
+
     Deliberately without the GAMG rebuild heuristics of LinearProblem: those
     track a history per operator, and an antisymmetric solve is the same
     problem at the same contrast as the symmetric one it accompanies, so the
     main operator's judgement carries over.
     """
 
-    def __init__(self, lhs_form, bcs, petsc_options, comm):
+    def __init__(self, lhs_form, bcs, petsc_options, func_space):
         self.lhs_form = lhs_form
         self.bcs = bcs
+        self.func_space = func_space
         self.mat = create_matrix(lhs_form)
+        comm = func_space.mesh.comm
         self.solver = PETSc.KSP().create(comm)
         self.solver.setOperators(self.mat)
-        prefix = f"parity_solver_{id(self)}"
-        self.solver.setOptionsPrefix(prefix)
-        opts = PETSc.Options()
-        opts.prefixPush(prefix)
-        for key, value in petsc_options.items():
-            opts[key] = value
-        opts.prefixPop()
-        self.solver.setFromOptions()
+        _apply_solver_options(self.solver, self.mat,
+                              f"parity_solver_{id(self)}", petsc_options,
+                              _solver_defaults(petsc_options))
+        self._iterative = petsc_options.get("ksp_type", "preonly") != "preonly"
+        if self._iterative:
+            self.solver.setInitialGuessNonzero(True)
+            if petsc_options.get("pc_type") == "gamg":
+                _set_rigid_body_modes(self.mat, func_space,
+                                      _dirichlet_rows(bcs))
+        self.fallback = _DivergenceFallback(comm, "antisymmetric")
+        self.rows = _constrained_rows(bcs, func_space)
+        self.needs_rescale = bool(comm.allreduce(self.rows.size > 0,
+                                                 op=_MPI.LOR))
 
     def assemble(self, spring_vec=None):
         self.mat.zeroEntries()
@@ -175,15 +523,17 @@ class _ParitySolver:
         self.mat.assemble()
         if spring_vec is not None:
             self.mat.setDiagonal(self.mat.getDiagonal() + spring_vec)
+        if self.needs_rescale:
+            _rescale_constrained_rows(self.mat, self.rows,
+                                      self.func_space.mesh.comm)
 
     def solve(self, rhs_vec, u_out):
-        self.solver.solve(rhs_vec, u_out)
-        reason = self.solver.getConvergedReason()
-        if reason < 0:
-            raise RuntimeError(
-                f"the antisymmetric solve did not converge (KSP reason "
-                f"{reason} after {self.solver.getIterationNumber()} "
-                f"iterations)")
+        self.fallback.solve(self.solver, self.mat, rhs_vec, u_out)
+
+    def destroy(self):
+        self.fallback.destroy()
+        self.solver.destroy()
+        self.mat.destroy()
 
 
 class LinearProblem:
@@ -281,64 +631,18 @@ class LinearProblem:
                     continue
                 self.parity_solvers[cls] = _ParitySolver(
                     self.lhs_form, direction_bcs[cls], petsc_options,
-                    u.function_space.mesh.comm)
+                    u.function_space)
 
         # Construct a linear solver
         self.solver = PETSc.KSP().create(self.u.function_space.mesh.comm)
         self.solver.setOperators(self.lhs_mat)
         prefix = f"linear_solver_{id(self)}"
-        self.solver.setOptionsPrefix(prefix)
 
-        # ── GAMG defaults for high-contrast topology optimization ──
-        # When β doubles (Heaviside sharpening), material contrast jumps and
-        # default GAMG settings (V-cycle, 0 agg smooths, threshold 0) produce
-        # poor coarse-grid operators → KSP iterations explode.
-        # These defaults are the standard recipe for SIMP-based topology
-        # optimization and can be overridden by explicit user petsc_options.
-        _pc_defaults = {}
-        if petsc_options.get("pc_type") == "gamg":
-            _pc_defaults = {
-                "pc_gamg_agg_nsmooths": 1,    # smoother aggregation (default 0)
-                "pc_gamg_threshold": 0.02,     # less aggressive coarsening
-                "mg_levels_ksp_max_it": 2,     # extra smoother sweeps per level
-                "pc_mg_cycle_type": "w",          # W-cycle for robustness
-                "ksp_max_it": 500,             # cap runaway solves (PETSc default 10000)
-            }
-
-        # ── hypre BoomerAMG defaults for elasticity ──
-        # BoomerAMG's scalar defaults ignore that our unknowns come in blocks
-        # of gdim displacement components per node.  Nodal coarsening plus
-        # interpolation that preserves the rigid-body modes is the elasticity
-        # recipe, and is hypre's counterpart to the near-nullspace we hand
-        # GAMG below.  Overridable by explicit user options, as with GAMG.
-        if petsc_options.get("pc_type") == "hypre":
-            # Measured on beam_3d, serial, against cg-gamg at 2.91 s/iter:
-            # plain BoomerAMG 19.2 (6.6x), these options 13.7 (4.5x), these
-            # options plus vec_interp_variant and a near-nullspace 47.8 (16x).
-            # So nodal coarsening earns its place and RBM-preserving
-            # interpolation does not.  hypre still loses to GAMG by 4.5x here
-            # and is deliberately NOT offered in the GUI solver menu; these
-            # defaults exist for anyone who selects it explicitly.
-            _pc_defaults = {
-                "pc_hypre_type": "boomeramg",
-                "pc_hypre_boomeramg_nodal_coarsen": 6,      # block coarsening
-                "pc_hypre_boomeramg_strong_threshold": 0.7,  # 3D elasticity
-                "pc_hypre_boomeramg_agg_nl": 1,
-                "ksp_max_it": 500,
-            }
+        _pc_defaults = _solver_defaults(petsc_options)
 
         # Apply PETSc options (solver defaults first, then user options override)
-        opts = PETSc.Options()
-        opts.prefixPush(prefix)
-        for key, value in _pc_defaults.items():
-            if key not in petsc_options:
-                opts[key] = value
-        for key, value in petsc_options.items():
-            opts[key] = value
-        opts.prefixPop()
-        self.solver.setFromOptions()
-        self.lhs_mat.setOptionsPrefix(prefix)
-        self.lhs_mat.setFromOptions()
+        _apply_solver_options(self.solver, self.lhs_mat, prefix,
+                              petsc_options, _pc_defaults)
 
         # Log the preconditioner defaults that were actually applied
         if _pc_defaults:
@@ -370,28 +674,22 @@ class LinearProblem:
             # the preconditioner every iteration (the density changes, so the
             # matrix changes), so that setup is never amortized.
             if petsc_options.get("pc_type") == "gamg":
-                self._set_near_nullspace()
+                _set_rigid_body_modes(self.lhs_mat, self.u.function_space,
+                                      _dirichlet_rows(self.bcs))
 
         self._first_solve = True
+        self._fallback = _DivergenceFallback(
+            self.u.function_space.mesh.comm, "equilibrium")
 
         # Owned local row indices carrying a Dirichlet condition, cached for
-        # _rescale_bc_diagonal.  Ghost entries are dropped: the diagonal vector
-        # only covers owned rows.
-        _n_owned = (self.u.function_space.dofmap.index_map.size_local
-                    * self.u.function_space.dofmap.index_map_bs)
-        _idx = []
-        for _bc in self.bcs:
-            try:
-                _d, _ = _bc.dof_indices()
-                _idx.append(np.asarray(_d, dtype=np.int32))
-            except Exception:
-                pass
+        # _rescale_bc_diagonal.
+        #
         # dolfinx_mpc writes diagval=1 into slave rows exactly as dolfinx does
         # for Dirichlet rows, so they need the same treatment.  Without this the
         # MPC paths -- diagonal and C4 symmetry, which cannot be expressed as a
         # plain Dirichlet condition -- keep the bad scaling: measured 63 Krylov
         # iterations against 8 on beam_3d.
-        _mpc_slaves = np.empty(0, dtype=np.int32)
+        _mpc_slaves = None
         if mpc is not None:
             try:
                 _mpc_slaves = np.asarray(mpc.slaves, dtype=np.int32)
@@ -399,34 +697,8 @@ class LinearProblem:
                 if self.u.function_space.mesh.comm.rank == 0:
                     print(f"  ⚠️  MPC slave rows not available for diagonal "
                           f"rescaling: {_exc}", flush=True)
-        if _idx:
-            _all = np.unique(np.concatenate(_idx))
-            _all = _all[_all < _n_owned]
-            # Keep only *partially* constrained nodes.  A full clamp binds
-            # every component of its node, leaving a clean identity block that
-            # GAMG handles without complaint -- rescaling those rows costs
-            # time and buys nothing (beam_3d without symmetry: 9 Krylov
-            # iterations either way, but 5.6% slower).  The damage comes from
-            # a node with some components bound and others free, which is what
-            # a symmetry roller produces, and what leaves a mixed block that
-            # defeats block aggregation.
-            _bs = self.u.function_space.dofmap.index_map_bs
-            if _all.size and _bs > 1:
-                _nodes, _counts = np.unique(_all // _bs, return_counts=True)
-                _partial = set(_nodes[_counts < _bs].tolist())
-                _all = _all[[int(d) // _bs in _partial for d in _all]]
-        else:
-            _all = np.empty(0, dtype=np.int32)
-
-        # MPC slave rows bypass the test above.  A C4 constraint couples every
-        # component of its node, so the node looks "fully constrained" while
-        # being nothing like a clamp -- it is a coupling, not an identity
-        # block.  Measured no benefit on shell_3d, but the quadcopter with C4
-        # is unmeasured, so they stay in rather than be excluded on a guess.
-        _slaves = _mpc_slaves[_mpc_slaves < _n_owned]
-        if _slaves.size:
-            _all = np.unique(np.concatenate([_all, _slaves]))
-        self._bc_dof_indices = _all
+        self._bc_dof_indices = _constrained_rows(
+            self.bcs, self.u.function_space, _mpc_slaves)
 
         # Decide once whether any rank has work to do, so an ordinary run pays
         # nothing per solve.  Collective, hence outside the branch above.
@@ -467,116 +739,9 @@ class LinearProblem:
             set_bc(vec, self._class_bcs(cls))
 
     def _rescale_bc_diagonal(self):
-        """Put the constrained rows on the same scale as the physical ones.
-
-        dolfinx writes 1.0 into constrained rows, but SIMP scales the physical
-        stiffness by rho^p, so the real diagonal sits near 1e-2 early on and
-        drifts over orders of magnitude as the density evolves.  That mismatch
-        wrecks GAMG's coarsening, and it gets worse the more of the boundary is
-        constrained: on a symmetry-reduced beam it cost **65** Krylov
-        iterations per solve instead of 8, which made exploiting symmetry
-        *slower* than solving the whole domain despite halving the mesh.
-
-        Every Dirichlet value here is zero, so ``set_bc`` writes 0 into the
-        right-hand side and the constrained unknown comes out 0 for any
-        non-zero diagonal.  The value is therefore free, and matching it to the
-        physical scale costs one O(n) pass over the diagonal.
-        """
-        # NOTE: the reduction below is collective, so every rank must reach it.
-        # Ranks owning no constrained rows still take part and contribute 0.0 --
-        # returning early here deadlocks, because whether a rank holds any
-        # Dirichlet dof depends on the partition.
-        diag = self.lhs_mat.getDiagonal()
-        arr = diag.array_w
-        idx = self._bc_dof_indices
-
-        local = 0.0
-        if arr.size:
-            mask = np.ones(arr.size, dtype=bool)
-            if idx.size:
-                mask[idx] = False
-            if mask.any():
-                local = float(np.median(np.abs(arr[mask])))
-
-        local_bc = 0.0
-        if idx.size:
-            local_bc = float(np.median(np.abs(arr[idx])))
-
-        comm = self.u.function_space.mesh.comm
-        scale = comm.allreduce(local, op=_MPI.MAX)
-        bc_scale = comm.allreduce(local_bc, op=_MPI.MAX)
-
-        # Only ever scale the constrained rows *down*.  A constrained diagonal
-        # far above the physical one breaks GAMG's aggregation -- that is the
-        # beam_3d case, 63 Krylov iterations against 8.  Far *below* is
-        # harmless and apparently even helpful: GAMG treats such a row as
-        # strongly constrained and leaves it out of the coarse space.  Raising
-        # it measurably hurt the quadcopter, whose E is 700x beam_3d's, at 10
-        # iterations against 11.5.  So this triggers on the damaging direction
-        # only.
-        if scale > 0.0 and idx.size and bc_scale > scale:
-            arr[idx] = scale
-            self.lhs_mat.setDiagonal(diag)
-        diag.destroy()
-
-    def _set_near_nullspace(self):
-        """Set the near-nullspace (rigid body modes) on the matrix for GAMG.
-
-        For 3D elasticity: 6 modes (3 translations + 3 rotations).
-        For 2D elasticity: 3 modes (2 translations + 1 rotation).
-
-        This dramatically improves GAMG coarsening quality for elasticity
-        problems, especially at high material contrast (late topology
-        optimization iterations).
-        """
-        V = self.u.function_space
-        dim = V.mesh.geometry.dim
-        bs = V.dofmap.index_map_bs
-        num_local = V.dofmap.index_map.size_local
-
-        # Tabulate DOF coordinates (only owned DOFs)
-        coords = V.tabulate_dof_coordinates()[:num_local]
-
-        def _make_vec(values_per_node):
-            """Create a PETSc Vec and fill it from (num_local, bs) array."""
-            vec = self.lhs_mat.createVecLeft()
-            arr = vec.getArray(readonly=False)
-            arr[:num_local * bs] = values_per_node.ravel()
-            return vec
-
-        modes = []
-        if dim == 3:
-            x, y, z = coords[:, 0], coords[:, 1], coords[:, 2]
-            zero = np.zeros(num_local)
-            one = np.ones(num_local)
-            # Translations: Tx, Ty, Tz
-            modes.append(_make_vec(np.column_stack([one, zero, zero])))
-            modes.append(_make_vec(np.column_stack([zero, one, zero])))
-            modes.append(_make_vec(np.column_stack([zero, zero, one])))
-            # Rotations: Rx=(0,-z,y), Ry=(z,0,-x), Rz=(-y,x,0)
-            modes.append(_make_vec(np.column_stack([zero, -z, y])))
-            modes.append(_make_vec(np.column_stack([z, zero, -x])))
-            modes.append(_make_vec(np.column_stack([-y, x, zero])))
-        else:
-            x, y = coords[:, 0], coords[:, 1]
-            zero = np.zeros(num_local)
-            one = np.ones(num_local)
-            # Translations: Tx, Ty
-            modes.append(_make_vec(np.column_stack([one, zero])))
-            modes.append(_make_vec(np.column_stack([zero, one])))
-            # Rotation: Rz=(-y, x)
-            modes.append(_make_vec(np.column_stack([-y, x])))
-
-        # Orthonormalize the modes
-        for i, vi in enumerate(modes):
-            for vj in modes[:i]:
-                vi.axpy(-vi.dot(vj), vj)
-            norm = vi.norm()
-            if norm > 1e-10:
-                vi.scale(1.0 / norm)
-
-        nsp = PETSc.NullSpace().create(vectors=modes, comm=V.mesh.comm)
-        self.lhs_mat.setNearNullSpace(nsp)
+        """Rescale this operator's constrained rows; see the module helper."""
+        _rescale_constrained_rows(self.lhs_mat, self._bc_dof_indices,
+                                  self.u.function_space.mesh.comm)
 
     def notify_beta_change(self, new_beta=None):
         """Proactively prepare solver for a Heaviside beta change.
@@ -674,12 +839,13 @@ class LinearProblem:
                     self.parity_solvers[cls].solve(vec, u_k)
                 else:
                     set_bc(vec, self.bcs)
-                    self.solver.solve(vec, u_k)
+                    self._fallback.solve(self.solver, self.lhs_mat, vec, u_k)
             # Keep u_field a valid field: Sensitivity replaces it with the
             # nominal load's response, but callbacks may read it before that.
             self.u_dir[0].copy(self.u_wrap)
         else:
-            self.solver.solve(self.rhs_vec, self.u_wrap)
+            self._fallback.solve(self.solver, self.lhs_mat,
+                                 self.rhs_vec, self.u_wrap)
         stats.stop('solve')
 
         # ── GAMG hierarchy rebuild heuristic ──
@@ -787,7 +953,7 @@ class LinearProblem:
         from fenitop.timing import stats
         stats.start('solve')
         rhs = -self.l_vec
-        self.solver.solve(rhs, self.lam_wrap)
+        self._fallback.solve(self.solver, self.lhs_mat, rhs, self.lam_wrap)
         rhs.destroy()
         stats.stop('solve')
         # MPC: recover slave DOF values (same pattern as solve_fem)
@@ -797,6 +963,9 @@ class LinearProblem:
         self.lam.x.scatter_forward()
 
     def __del__(self):
+        for solver in getattr(self, "parity_solvers", {}).values():
+            solver.destroy()
+        self._fallback.destroy()
         self.solver.destroy()
         self.lhs_mat.destroy()
         self.rhs_vec.destroy()
