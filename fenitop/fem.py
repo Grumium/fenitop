@@ -37,6 +37,10 @@ from fenitop.utility import create_mechanism_vectors
 from fenitop.utility import LinearProblem
 
 
+#: How many direction combinations several uncertain loads may be resolved
+#: into before the setup is rejected as too expensive to evaluate.
+_SCENARIO_LIMIT = 200_000
+
 #: Which coordinate axes each admissible load plane is spanned by.
 PLANE_AXES = {"xy": (0, 1), "xz": (0, 2), "yz": (1, 2)}
 
@@ -47,8 +51,8 @@ def direction_mode(value):
     ``"fixed"``        the load acts exactly as entered (the default)
     ``"any"``          its direction is unknown, over every axis
     ``"xy"``/``"xz"``/``"yz"``
-                       its direction stays in that coordinate plane, with a
-                       bounded perpendicular share of the entered direction
+                       it may turn within that coordinate plane, by an angle
+                       the entered percentage bounds
     """
     mode = str(value if value is not None else "fixed").lower()
     if mode not in ("fixed", "any") and mode not in PLANE_AXES:
@@ -117,7 +121,9 @@ def _check_uncertain_direction(fem, opt, settings):
             continue
         if not 0.0 <= ratio <= 1.0:
             problems.append(f"transverse_ratio of load {index} must be within "
-                            f"[0, 1], got {ratio}")
+                            f"[0, 1], got {ratio}: it is the sideways share "
+                            "of the load reached at two standard deviations, "
+                            "so 1 already means a right angle")
         if max(PLANE_AXES[mode]) >= gdim:
             problems.append(f"the {mode} plane needs a {max(PLANE_AXES[mode])+1}D "
                             f"mesh, this one is {gdim}D")
@@ -158,11 +164,68 @@ def _check_uncertain_direction(fem, opt, settings):
             + "; ".join(problems) + ".")
 
 
-def _load_basis(mode, ratio, value, gdim):
-    """Basis directions, nominal coefficients and moments for one load.
+#: Directions of the twelve icosahedron vertices, a spherical 5-design: any
+#: polynomial of degree five or less averages over them to its exact mean over
+#: the sphere, which is two degrees more than the objective below asks for.
+_GOLDEN = (1 + 5**0.5)/2
+_ICOSAHEDRON = np.array(
+    [[0, s1, s2*_GOLDEN] for s1 in (-1, 1) for s2 in (-1, 1)]
+    + [[s1, s2*_GOLDEN, 0] for s1 in (-1, 1) for s2 in (-1, 1)]
+    + [[s1*_GOLDEN, 0, s2] for s1 in (-1, 1) for s2 in (-1, 1)], dtype=float)
+_ICOSAHEDRON /= np.linalg.norm(_ICOSAHEDRON, axis=1, keepdims=True)
 
-    Returns ``(directions, magnitude, nominal, mean, cov)``: the basis loads
-    all carry the entered magnitude, so the coefficients are dimensionless.
+
+def _angle_rule(sigma, tol=1e-13, limit=64):
+    """Angles and weights representing a rotation by ``N(0, sigma^2)``.
+
+    The objective needs the mean and the variance of a quadratic form in the
+    rotated direction, so nothing beyond the fourth moment of ``(cos t, sin t)``
+    ever enters -- that is, ``E[cos k t]`` for ``k <= 4``, which the Gaussian
+    gives in closed form as ``exp(-k^2 sigma^2/2)``.  Gauss-Hermite nodes
+    reproduce those four numbers, and the count is raised until they do so to
+    *tol*, which keeps the rule at eight points for the small angles that
+    ordinary percentages describe and only pays for more near a right angle.
+    """
+    if sigma <= 0.0:               # a direction that is not uncertain at all
+        return np.zeros(1), np.ones(1)
+    n = 8
+    while True:
+        nodes, weights = np.polynomial.hermite_e.hermegauss(n)
+        weights = weights/weights.sum()
+        theta = sigma*nodes
+        error = max(abs(float((weights*np.cos(k*theta)).sum())
+                        - np.exp(-0.5*k*k*sigma*sigma)) for k in range(1, 5))
+        if error < tol or n >= limit:
+            return theta, weights
+        n *= 2
+
+
+def _sphere_rule(gdim):
+    """Directions and weights for a direction that is uniform over all of them."""
+    if gdim == 2:
+        angles = np.arange(8)*(np.pi/4)
+        return (np.column_stack([np.cos(angles), np.sin(angles)]),
+                np.full(8, 1/8))
+    return _ICOSAHEDRON.copy(), np.full(len(_ICOSAHEDRON), 1/len(_ICOSAHEDRON))
+
+
+def _load_basis(mode, ratio, value, gdim):
+    """Basis directions, and the load's direction distribution over them.
+
+    Returns ``(directions, magnitude, nominal, nodes, weights)``: the basis
+    loads all carry the entered magnitude, so the coefficients over them are
+    dimensionless.  ``nodes`` lists the coefficient vectors the direction may
+    take and ``weights`` how much each counts, together representing the
+    distribution exactly as far as the objective can tell -- see `_angle_rule`.
+
+    **The load turns, it does not grow.**  Every node is a unit vector, so the
+    magnitude the user entered is the magnitude that is applied, whichever way
+    the load ends up pointing.  ``ratio`` is read as the sideways share of that
+    magnitude reached at two standard deviations: "+-30 %" means the direction
+    tilts far enough for 30 % of the load to act across the entered one, so
+    ``sigma = arcsin(ratio)/2``.  Small percentages therefore tilt by about
+    ``ratio/2`` radians, and 100 % is a right angle rather than some fraction
+    of one.
 
     The basis is always made of **coordinate axes** -- every axis of the mesh
     for ``"any"``, the two axes of the plane for a plane mode.  Aligning it
@@ -172,20 +235,12 @@ def _load_basis(mode, ratio, value, gdim):
     normal is antisymmetric, purely tangential is symmetric, and anything
     between is neither.  Keeping the basis on the axes is what lets a
     symmetric half domain carry an uncertain load at all.
-
-    Nothing about the model changes with the basis: the entered direction
-    becomes the mean's coefficients, and the perpendicular scatter becomes an
-    off-diagonal covariance rather than a diagonal one.  ``ratio`` bounds that
-    scatter and is read as two standard deviations, which is the interval an
-    entered "+-10%" describes -- a hard bound is not something a normal
-    distribution has room for, and reading it as one standard deviation
-    instead would put a third of the draws outside what the user wrote down.
     """
     magnitude = float(np.linalg.norm(value))
     if mode == "any":
         directions = [row.copy() for row in np.eye(gdim)]
-        return (directions, magnitude, value/magnitude,
-                np.zeros(gdim), np.eye(gdim)/gdim)
+        nodes, weights = _sphere_rule(gdim)
+        return directions, magnitude, value/magnitude, nodes, weights
 
     axes = list(PLANE_AXES[mode])
     directions = []
@@ -194,13 +249,13 @@ def _load_basis(mode, ratio, value, gdim):
         e[axis] = 1.0
         directions.append(e)
 
-    # Coefficients of the entered direction, and of the perpendicular the
-    # scatter acts along, in that two-axis basis.
+    # The entered direction and the perpendicular it turns towards, both as
+    # coefficients over the two axes of the plane.
     d = value[axes]/np.linalg.norm(value[axes])
     perpendicular = np.array([-d[1], d[0]])
-    sigma = 0.5*ratio
-    return (directions, magnitude, d.copy(), d.copy(),
-            sigma*sigma*np.outer(perpendicular, perpendicular))
+    theta, weights = _angle_rule(0.5*np.arcsin(min(max(ratio, 0.0), 1.0)))
+    nodes = np.cos(theta)[:, None]*d + np.sin(theta)[:, None]*perpendicular
+    return directions, magnitude, d.copy(), nodes, weights
 
 
 def form_fem(fem, opt):
@@ -398,11 +453,12 @@ def form_fem(fem, opt):
     # Loads with an uncertain direction.  The compliance is a quadratic form
     # in the applied load, so the response to any admissible load is a linear
     # combination of the responses to a basis: `dim` orthogonal loads on the
-    # same facets for a free direction, two for a coordinate plane.  Sampling
-    # angles is unnecessary, and so is a second FEM solve for the nominal
-    # load -- it is a combination of the basis too, which is why the
-    # deterministic part of the load (fixed tractions and the body force)
-    # enters as leading basis vectors rather than as a separate solve.
+    # same facets for a free direction, two for a coordinate plane.  Every
+    # direction the load might take is then a coefficient vector over that
+    # basis, so a whole distribution of directions costs no further FEM
+    # solves -- and neither does the nominal load, which is why the
+    # deterministic part (fixed tractions and the body force) enters as
+    # leading basis vectors rather than as a separate solve.
     # Sensitivity._evaluate_direction() reads the objective off them.
     opt["direction_rhs"] = None
     opt["direction_modes"] = [mode for mode, _ in direction_config]
@@ -411,7 +467,7 @@ def form_fem(fem, opt):
     opt["direction_bcs"] = None
     if uncertain:
         gdim = mesh.geometry.dim
-        forms, mean, cov_blocks, nominal, parity = [], [], [], [], []
+        forms, blocks, nominal, parity = [], [], [], []
 
         # Every basis load is one Cartesian component on one facet group, so
         # its parity about each mirror plane is decided by the axis alone:
@@ -461,36 +517,43 @@ def form_fem(fem, opt):
             # quadratic form: its cross terms with the uncertain loads are
             # what makes the objective see them acting together.
             forms.append(deterministic[cls])
-            mean.append([1.0])
+            blocks.append((np.ones((1, 1)), np.ones(1)))
             nominal.append([1.0])
-            cov_blocks.append(np.zeros((1, 1)))
             parity.append(cls)
 
         for i in uncertain:
             mode, ratio = direction_config[i]
             value = np.asarray(fem["traction_bcs"][i][0], dtype=float)
-            directions, magnitude, nom, mean_i, cov_i = _load_basis(
+            directions, magnitude, nom, nodes, weights = _load_basis(
                 mode, ratio, value, gdim)
             marker = uncertain_markers[i]
             for d in directions:
                 forms.append(ufl.dot(Constant(mesh, d*magnitude), v)*ds(marker))
                 parity.append(parity_of(int(np.argmax(np.abs(d)))))
-            mean.append(mean_i)
+            blocks.append((nodes, weights))
             nominal.append(nom)
-            cov_blocks.append(cov_i)
 
-        size = sum(len(block) for block in cov_blocks)
-        covariance = np.zeros((size, size))
-        offset = 0
-        for block in cov_blocks:
-            end = offset + len(block)
-            covariance[offset:end, offset:end] = block
-            offset = end
+        # One block per load, each with its own directions; the loads turn
+        # independently, so what the structure has to carry is every
+        # combination of them.  Building that product here means the objective
+        # never has to know how the blocks were made.
+        scenarios, scenario_weights = np.zeros((1, 0)), np.ones(1)
+        for nodes, weights in blocks:
+            count = len(nodes)
+            if len(scenarios)*count > _SCENARIO_LIMIT:
+                raise ValueError(
+                    f"{len(blocks)} loads with an uncertain direction would "
+                    f"need more than {_SCENARIO_LIMIT} direction combinations. "
+                    "Fix the direction of some of them, or narrow the ones "
+                    "entered as a free direction to a coordinate plane.")
+            scenarios = np.hstack([np.repeat(scenarios, count, axis=0),
+                                   np.tile(nodes, (len(scenarios), 1))])
+            scenario_weights = np.outer(scenario_weights, weights).ravel()
 
         opt["direction_rhs"] = forms
-        opt["direction_mu"] = np.concatenate(mean)
         opt["direction_nominal"] = np.concatenate(nominal)
-        opt["direction_cov"] = covariance
+        opt["direction_scenarios"] = scenarios
+        opt["direction_weights"] = scenario_weights
         opt["direction_parity"] = parity
 
         if mirror_planes:

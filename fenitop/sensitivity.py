@@ -53,17 +53,21 @@ class Sensitivity():
         # sum_i c_i f_i is the quadratic form c^T A c with A[i,j] = f_i . u_j
         # over the basis loads assembled in form_fem(), so once the basis is
         # solved every statistic of the compliance follows from a matrix of
-        # side `len(direction_rhs)` -- no angle sampling, and no further FEM
-        # solves whatever the load distribution is.
+        # side `len(direction_rhs)` -- no further FEM solves whatever the
+        # load distribution is.
         #
-        # Modelling c as a random vector of mean `mu` and covariance `cov`
-        # rather than as a member of a set, both moments are closed form:
+        # The load is modelled as turning, not as growing: c ranges over the
+        # directions the load may point in, all of the entered magnitude.
+        # form_fem() resolves that into weighted direction combinations, and
+        # the two moments are then plain weighted sums over them,
         #
-        #     E[C]   = <A, mu mu^T + cov>
-        #     Var[C] = 2 tr(A cov A cov) + 4 mu^T A cov A mu
+        #     E[C]   = sum_s w_s C_s,   Var[C] = sum_s w_s (C_s - E[C])^2,
+        #     C_s    = c_s^T A c_s
         #
-        # and the objective is their 2-norm, following Torii (CMAME 352,
-        # 2019): J = sqrt(E^2 + (kappa*sd)^2).  The familiar weighted sum
+        # exact for the distribution because the rule reproduces every moment
+        # of the direction the quadratic form can see.  The objective is their
+        # 2-norm, following Torii (CMAME 352, 2019):
+        # J = sqrt(E^2 + (kappa*sd)^2).  The familiar weighted sum
         # E + kappa*sd is the same expression with the 1-norm, for which no
         # proof of physical consistency is available; for the 2-norm,
         # kappa <= 1 -- no more weight on the scatter than on the mean --
@@ -74,15 +78,17 @@ class Sensitivity():
         self.u_field = u_field
         if self.direction_rhs:
             self.problem = problem
-            self.dir_mu = np.asarray(opt["direction_mu"], dtype=float)
-            self.dir_cov = np.asarray(opt["direction_cov"], dtype=float)
+            self.dir_scenarios = np.asarray(
+                opt["direction_scenarios"], dtype=float)
+            self.dir_weights = np.asarray(
+                opt["direction_weights"], dtype=float)
             self.dir_kappa = float(opt.get("direction_kappa", 1.0))
             # The load to show in the viewer.  The worst case is no longer
             # the field being optimized -- the objective covers a whole
             # distribution -- so the nominal load is both the honest choice
             # and a stable one from iteration to iteration.
             self.dir_nominal = np.asarray(
-                opt.get("direction_nominal", self.dir_mu), dtype=float)
+                opt["direction_nominal"], dtype=float)
             # Which parity class each basis load belongs to on a symmetric
             # half domain; all zeros when the domain is whole.
             self.dir_parity = np.asarray(
@@ -142,8 +148,8 @@ class Sensitivity():
         """Objective over the load distribution, and its gradient.
 
         Assembles A once from the basis solutions, reads both moments off it
-        in closed form, and turns the derivative of the objective with
-        respect to A into a design sensitivity.
+        by summing over the direction combinations, and turns the derivative
+        of the objective with respect to A into a design sensitivity.
 
         That last step is the only part worth explaining.  dJ/drho is
         sum_ij G_ij * dA_ij/drho with G = dJ/dA, and dA_ij/drho = -u_i^T K'
@@ -182,16 +188,18 @@ class Sensitivity():
         same_class = self.dir_parity[:, None] == self.dir_parity[None, :]
         A = np.where(same_class, A, 0.0)
 
-        mu, cov, kappa = self.dir_mu, self.dir_cov, self.dir_kappa
-        P = np.outer(mu, mu)
-        A_cov = A @ cov
+        scenarios, weights = self.dir_scenarios, self.dir_weights
+        kappa = self.dir_kappa
 
-        mean = float(np.sum(A*(P + cov)))
-        # Clipped because round-off can take a variance of zero -- a load with
-        # no scatter left, or a design that carries every direction alike --
-        # a little below it.
-        variance = max(float(2.0*np.trace(A_cov @ A_cov)
-                             + 4.0*(mu @ A_cov @ A @ mu)), 0.0)
+        # The compliance under each direction combination, then its mean and
+        # scatter over them.  The variance is clipped because round-off can
+        # take it a little below zero when there is nothing to scatter -- a
+        # load with no uncertainty left, or a design that carries every
+        # direction alike.
+        compliances = np.einsum("si,ij,sj->s", scenarios, A, scenarios)
+        mean = float(weights @ compliances)
+        deviations = compliances - mean
+        variance = max(float(weights @ (deviations*deviations)), 0.0)
         J = float(np.sqrt(mean*mean + kappa*kappa*variance))
 
         if J <= 0.0:               # no load reaches the structure
@@ -200,12 +208,14 @@ class Sensitivity():
             self._combine(self.dir_nominal)
             return 0.0
 
-        # dJ/dA = [E*dE/dA + kappa^2*dVar/dA / 2] / J, with
-        #   dE/dA   = mu mu^T + cov
-        #   dVar/dA = 4 cov A cov + 4 (mu mu^T A cov + cov A mu mu^T)
-        cross = P @ A_cov
-        G = (mean*(P + cov)
-             + 2.0*kappa*kappa*(cov @ A_cov + cross + cross.T)) / J
+        # dJ/dA is a weighted sum of the same rank-one terms, because each
+        # C_s contributes dC_s/dA = c_s c_s^T:
+        #   dJ/dA = sum_s w_s [E + kappa^2 (C_s - E)] c_s c_s^T / J
+        # The bracket is what each direction is worth at the margin: the mean
+        # counts everywhere, and the scatter adds weight to the combinations
+        # that are worse than average while taking it off the mild ones.
+        gains = weights*(mean + kappa*kappa*deviations)/J
+        G = scenarios.T @ (gains[:, None]*scenarios)
 
         G = np.where(same_class, 0.5*(G + G.T), 0.0)
         with self.dCdrho_vec.localForm() as loc:
