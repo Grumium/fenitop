@@ -51,8 +51,8 @@ def direction_mode(value):
     ``"fixed"``        the load acts exactly as entered (the default)
     ``"any"``          its direction is unknown, over every axis
     ``"xy"``/``"xz"``/``"yz"``
-                       it may turn within that coordinate plane, by an angle
-                       the entered percentage bounds
+                       it may turn within that coordinate plane, by up to the
+                       entered angle
     """
     mode = str(value if value is not None else "fixed").lower()
     if mode not in ("fixed", "any") and mode not in PLANE_AXES:
@@ -62,14 +62,33 @@ def direction_mode(value):
     return mode
 
 
+def _turn_angle(entry, fallback):
+    """The half-range a plane mode may turn through, in degrees.
+
+    ``direction_angle`` is the setting.  ``transverse_ratio`` is the older
+    spelling, from when the load gained a perpendicular force rather than
+    turning: it named the sideways share of the load, which is the sine of
+    the same angle, so it converts exactly and old setups keep their meaning.
+    """
+    for source in (entry, fallback):
+        if source is None:
+            continue
+        if source.get("direction_angle") is not None:
+            return float(source["direction_angle"])
+        if source.get("transverse_ratio") is not None:
+            ratio = min(max(float(source["transverse_ratio"]), 0.0), 1.0)
+            return float(np.degrees(np.arcsin(ratio)))
+    return 0.0
+
+
 def direction_settings(fem):
-    """One ``(mode, ratio)`` pair per traction.
+    """One ``(mode, angle)`` pair per traction, the angle in degrees.
 
     Read from ``fem["direction_modes"]``, a list parallel to
     ``traction_bcs``.  The older scalar spelling -- ``direction_mode`` and
-    ``transverse_ratio`` on ``fem`` itself, from when only one load could be
-    uncertain -- is accepted and applies to every traction, as does
-    ``uncertain_direction: True`` for ``"any"``.
+    ``direction_angle``/``transverse_ratio`` on ``fem`` itself, from when only
+    one load could be uncertain -- is accepted and applies to every traction,
+    as does ``uncertain_direction: True`` for ``"any"``.
     """
     n = len(fem["traction_bcs"])
     entries = fem.get("direction_modes")
@@ -77,8 +96,7 @@ def direction_settings(fem):
         scalar = fem.get("direction_mode")
         if scalar is None:
             scalar = "any" if fem.get("uncertain_direction") else "fixed"
-        entries = [{"mode": scalar,
-                    "transverse_ratio": fem.get("transverse_ratio", 0.0)}] * n
+        entries = [{"mode": scalar}] * n
     if len(entries) != n:
         raise ValueError(f"direction_modes has {len(entries)} entries for "
                          f"{n} tractions.")
@@ -86,11 +104,11 @@ def direction_settings(fem):
     for entry in entries:
         if isinstance(entry, dict):
             mode = direction_mode(entry.get("mode", entry.get("direction_mode")))
-            ratio = float(entry.get("transverse_ratio", 0.0))
+            angle = _turn_angle(entry, fem)
         else:                       # a bare mode string
             mode = direction_mode(entry)
-            ratio = float(fem.get("transverse_ratio", 0.0))
-        settings.append((mode, ratio))
+            angle = _turn_angle(None, fem)
+        settings.append((mode, angle))
     return settings
 
 
@@ -111,7 +129,7 @@ def _check_uncertain_direction(fem, opt, settings):
         return
     problems = []
     gdim = fem["mesh"].geometry.dim
-    for index, (mode, ratio) in enumerate(settings):
+    for index, (mode, angle) in enumerate(settings):
         if mode == "fixed":
             continue
         value = np.asarray(fem["traction_bcs"][index][0], dtype=float)
@@ -119,11 +137,11 @@ def _check_uncertain_direction(fem, opt, settings):
             problems.append(f"load {index} is zero, so it has no direction")
         if mode not in PLANE_AXES:
             continue
-        if not 0.0 <= ratio <= 1.0:
-            problems.append(f"transverse_ratio of load {index} must be within "
-                            f"[0, 1], got {ratio}: it is the sideways share "
-                            "of the load reached at two standard deviations, "
-                            "so 1 already means a right angle")
+        if not 0.0 <= angle <= 90.0:
+            problems.append(f"direction_angle of load {index} must be within "
+                            f"[0, 90] degrees, got {angle}: it is how far the "
+                            "load may turn, and a right angle is as far as "
+                            "that goes")
         if max(PLANE_AXES[mode]) >= gdim:
             problems.append(f"the {mode} plane needs a {max(PLANE_AXES[mode])+1}D "
                             f"mesh, this one is {gdim}D")
@@ -209,7 +227,7 @@ def _sphere_rule(gdim):
     return _ICOSAHEDRON.copy(), np.full(len(_ICOSAHEDRON), 1/len(_ICOSAHEDRON))
 
 
-def _load_basis(mode, ratio, value, gdim):
+def _load_basis(mode, angle, value, gdim):
     """Basis directions, and the load's direction distribution over them.
 
     Returns ``(directions, magnitude, nominal, nodes, weights)``: the basis
@@ -220,12 +238,10 @@ def _load_basis(mode, ratio, value, gdim):
 
     **The load turns, it does not grow.**  Every node is a unit vector, so the
     magnitude the user entered is the magnitude that is applied, whichever way
-    the load ends up pointing.  ``ratio`` is read as the sideways share of that
-    magnitude reached at two standard deviations: "+-30 %" means the direction
-    tilts far enough for 30 % of the load to act across the entered one, so
-    ``sigma = arcsin(ratio)/2``.  Small percentages therefore tilt by about
-    ``ratio/2`` radians, and 100 % is a right angle rather than some fraction
-    of one.
+    the load ends up pointing.  ``angle`` is that turn in degrees, read as two
+    standard deviations: "+-30 deg" means the direction stays within 30
+    degrees of the entered one about 95 % of the time, so
+    ``sigma = radians(angle)/2``.
 
     The basis is always made of **coordinate axes** -- every axis of the mesh
     for ``"any"``, the two axes of the plane for a plane mode.  Aligning it
@@ -253,7 +269,7 @@ def _load_basis(mode, ratio, value, gdim):
     # coefficients over the two axes of the plane.
     d = value[axes]/np.linalg.norm(value[axes])
     perpendicular = np.array([-d[1], d[0]])
-    theta, weights = _angle_rule(0.5*np.arcsin(min(max(ratio, 0.0), 1.0)))
+    theta, weights = _angle_rule(0.5*np.radians(min(max(angle, 0.0), 90.0)))
     nodes = np.cos(theta)[:, None]*d + np.sin(theta)[:, None]*perpendicular
     return directions, magnitude, d.copy(), nodes, weights
 
@@ -522,10 +538,10 @@ def form_fem(fem, opt):
             parity.append(cls)
 
         for i in uncertain:
-            mode, ratio = direction_config[i]
+            mode, angle = direction_config[i]
             value = np.asarray(fem["traction_bcs"][i][0], dtype=float)
             directions, magnitude, nom, nodes, weights = _load_basis(
-                mode, ratio, value, gdim)
+                mode, angle, value, gdim)
             marker = uncertain_markers[i]
             for d in directions:
                 forms.append(ufl.dot(Constant(mesh, d*magnitude), v)*ds(marker))
