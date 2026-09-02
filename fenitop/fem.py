@@ -41,21 +41,16 @@ from fenitop.utility import LinearProblem
 PLANE_AXES = {"xy": (0, 1), "xz": (0, 2), "yz": (1, 2)}
 
 
-def direction_mode(fem):
-    """Normalize the load-direction setting to one of the supported modes.
+def direction_mode(value):
+    """Normalize one load-direction setting to a supported mode.
 
     ``"fixed"``        the load acts exactly as entered (the default)
     ``"any"``          its direction is unknown, over every axis
     ``"xy"``/``"xz"``/``"yz"``
-                       its direction stays in that coordinate plane
-
-    ``uncertain_direction: True`` is accepted as the older spelling of
-    ``"any"``.
+                       its direction stays in that coordinate plane, with a
+                       bounded perpendicular share of the entered direction
     """
-    mode = fem.get("direction_mode")
-    if mode is None:
-        mode = "any" if fem.get("uncertain_direction") else "fixed"
-    mode = str(mode).lower()
+    mode = str(value if value is not None else "fixed").lower()
     if mode not in ("fixed", "any") and mode not in PLANE_AXES:
         raise ValueError(
             f"direction_mode must be 'fixed', 'any' or one of "
@@ -63,59 +58,155 @@ def direction_mode(fem):
     return mode
 
 
-def _check_uncertain_direction(fem, opt):
-    """Reject the combinations the worst-direction formulation cannot handle.
+def direction_settings(fem):
+    """One ``(mode, ratio)`` pair per traction.
 
-    Checked before anything is assembled, so the reason is the first thing the
-    caller sees rather than a wrong result or a failure further in.  The
-    formulation resolves *the* load into a direction basis and reads the worst
-    case off a small compliance matrix; that argument needs the uncertain load
-    to be the only thing loading the structure.
+    Read from ``fem["direction_modes"]``, a list parallel to
+    ``traction_bcs``.  The older scalar spelling -- ``direction_mode`` and
+    ``transverse_ratio`` on ``fem`` itself, from when only one load could be
+    uncertain -- is accepted and applies to every traction, as does
+    ``uncertain_direction: True`` for ``"any"``.
     """
-    mode = direction_mode(fem)
-    if mode == "fixed":
+    n = len(fem["traction_bcs"])
+    entries = fem.get("direction_modes")
+    if entries is None:
+        scalar = fem.get("direction_mode")
+        if scalar is None:
+            scalar = "any" if fem.get("uncertain_direction") else "fixed"
+        entries = [{"mode": scalar,
+                    "transverse_ratio": fem.get("transverse_ratio", 0.0)}] * n
+    if len(entries) != n:
+        raise ValueError(f"direction_modes has {len(entries)} entries for "
+                         f"{n} tractions.")
+    settings = []
+    for entry in entries:
+        if isinstance(entry, dict):
+            mode = direction_mode(entry.get("mode", entry.get("direction_mode")))
+            ratio = float(entry.get("transverse_ratio", 0.0))
+        else:                       # a bare mode string
+            mode = direction_mode(entry)
+            ratio = float(fem.get("transverse_ratio", 0.0))
+        settings.append((mode, ratio))
+    return settings
+
+
+def _check_uncertain_direction(fem, opt, settings):
+    """Reject the combinations the load-distribution objective cannot handle.
+
+    Checked before anything is assembled, so the reason is the first thing
+    the caller sees rather than a wrong result or a failure further in.
+
+    The objective reads the moments of the compliance off a matrix over the
+    load basis, which is linear in the design's response to each basis load
+    and needs nothing about how many loads there are -- so unlike the
+    worst-case formulation this replaced, other loads, a body force and
+    several uncertain loads at once are all fine.  What remains are the
+    genuine incompatibilities.
+    """
+    if all(mode == "fixed" for mode, _ in settings):
         return
     problems = []
     gdim = fem["mesh"].geometry.dim
-    if mode in PLANE_AXES:
+    for index, (mode, ratio) in enumerate(settings):
+        if mode == "fixed":
+            continue
+        value = np.asarray(fem["traction_bcs"][index][0], dtype=float)
+        if np.linalg.norm(value) == 0.0:
+            problems.append(f"load {index} is zero, so it has no direction")
+        if mode not in PLANE_AXES:
+            continue
+        if not 0.0 <= ratio <= 1.0:
+            problems.append(f"transverse_ratio of load {index} must be within "
+                            f"[0, 1], got {ratio}")
         if max(PLANE_AXES[mode]) >= gdim:
             problems.append(f"the {mode} plane needs a {max(PLANE_AXES[mode])+1}D "
                             f"mesh, this one is {gdim}D")
-        eps = float(fem.get("transverse_ratio", 0.0))
-        if not 0.0 <= eps <= 1.0:
-            problems.append(f"transverse_ratio must be within [0, 1], got {eps}")
-        if len(fem["traction_bcs"]) == 1 and max(PLANE_AXES[mode]) < gdim:
-            value = np.asarray(fem["traction_bcs"][0][0], dtype=float)
-            out_of_plane = np.linalg.norm(
-                np.delete(value, list(PLANE_AXES[mode])))
-            in_plane = np.linalg.norm(value[list(PLANE_AXES[mode])])
-            if in_plane <= 0.0:
-                problems.append(f"the load has no component in the {mode} plane, "
-                                "so it has no main direction there")
-            elif out_of_plane > 1e-9 * max(np.linalg.norm(value), 1.0):
-                problems.append(
-                    f"the load must lie in the {mode} plane, but its "
-                    f"out-of-plane component is {out_of_plane:.3g} "
-                    f"against {in_plane:.3g} in plane")
-    if len(fem["traction_bcs"]) != 1:
-        problems.append("exactly one traction is required, found "
-                        f"{len(fem['traction_bcs'])}")
-    if np.any(np.asarray(fem["body_force"], dtype=float)):
-        problems.append("the body force must be zero")
+            continue
+        axes = list(PLANE_AXES[mode])
+        out_of_plane = np.linalg.norm(np.delete(value, axes))
+        in_plane = np.linalg.norm(value[axes])
+        if in_plane <= 0.0:
+            problems.append(f"load {index} has no component in the {mode} "
+                            "plane, so it has no main direction there")
+        elif out_of_plane > 1e-9 * max(np.linalg.norm(value), 1.0):
+            problems.append(
+                f"load {index} must lie in the {mode} plane, but its "
+                f"out-of-plane component is {out_of_plane:.3g} "
+                f"against {in_plane:.3g} in plane")
+    kappa = float(opt.get("direction_kappa", 1.0))
+    if not 0.0 <= kappa <= 1.0:
+        problems.append(
+            f"direction_kappa must be within [0, 1], got {kappa}: weighting "
+            "the scatter above the mean forfeits the consistency proof")
     if not opt["opt_compliance"]:
         problems.append("the objective must be compliance")
-    if fem.get("symmetry_bcs"):
-        problems.append("symmetry planes cannot be exploited, because an "
-                        "uncertain load direction is not symmetric")
+    exotic = [sbc.get("type") for sbc in fem.get("symmetry_bcs", [])
+              if sbc.get("type", "axis_aligned") != "axis_aligned"]
+    if exotic:
+        problems.append(
+            f"symmetry of type {sorted(set(exotic))} cannot be exploited: the "
+            "load basis is resolved into parities about coordinate axes, "
+            "which a diagonal plane or a rotation does not provide")
+    axes = [sbc.get("component") for sbc in fem.get("symmetry_bcs", [])
+            if sbc.get("type", "axis_aligned") == "axis_aligned"]
+    if len(set(axes)) != len(axes):
+        problems.append("two symmetry planes share a normal axis, so their "
+                        "parities are not independent")
     if problems:
         raise ValueError(
-            f"direction_mode={mode!r} is limited to a single load carrying "
-            "the whole problem: " + "; ".join(problems) + ".")
+            "an uncertain load direction is incompatible with this setup: "
+            + "; ".join(problems) + ".")
+
+
+def _load_basis(mode, ratio, value, gdim):
+    """Basis directions, nominal coefficients and moments for one load.
+
+    Returns ``(directions, magnitude, nominal, mean, cov)``: the basis loads
+    all carry the entered magnitude, so the coefficients are dimensionless.
+
+    The basis is always made of **coordinate axes** -- every axis of the mesh
+    for ``"any"``, the two axes of the plane for a plane mode.  Aligning it
+    with the load instead would be the more natural choice for a plane, and
+    was what this did at first, but a coordinate axis is the only direction
+    with a definite parity about an axis-aligned symmetry plane: purely
+    normal is antisymmetric, purely tangential is symmetric, and anything
+    between is neither.  Keeping the basis on the axes is what lets a
+    symmetric half domain carry an uncertain load at all.
+
+    Nothing about the model changes with the basis: the entered direction
+    becomes the mean's coefficients, and the perpendicular scatter becomes an
+    off-diagonal covariance rather than a diagonal one.  ``ratio`` bounds that
+    scatter and is read as two standard deviations, which is the interval an
+    entered "+-10%" describes -- a hard bound is not something a normal
+    distribution has room for, and reading it as one standard deviation
+    instead would put a third of the draws outside what the user wrote down.
+    """
+    magnitude = float(np.linalg.norm(value))
+    if mode == "any":
+        directions = [row.copy() for row in np.eye(gdim)]
+        return (directions, magnitude, value/magnitude,
+                np.zeros(gdim), np.eye(gdim)/gdim)
+
+    axes = list(PLANE_AXES[mode])
+    directions = []
+    for axis in axes:
+        e = np.zeros(gdim)
+        e[axis] = 1.0
+        directions.append(e)
+
+    # Coefficients of the entered direction, and of the perpendicular the
+    # scatter acts along, in that two-axis basis.
+    d = value[axes]/np.linalg.norm(value[axes])
+    perpendicular = np.array([-d[1], d[0]])
+    sigma = 0.5*ratio
+    return (directions, magnitude, d.copy(), d.copy(),
+            sigma*sigma*np.outer(perpendicular, perpendicular))
 
 
 def form_fem(fem, opt):
     """Form an FEA problem."""
-    _check_uncertain_direction(fem, opt)
+    direction_config = direction_settings(fem)
+    _check_uncertain_direction(fem, opt, direction_config)
 
 
     # Function spaces and functions
@@ -162,20 +253,25 @@ def form_fem(fem, opt):
     # symmetry plane.  Axis-aligned planes use a simple Dirichlet BC on a
     # single component.  Diagonal planes are handled via dolfinx_mpc slip
     # constraints (u · n = 0) further below.
+    def _component_bc(facets, comp):
+        """Pin one displacement component to zero on *facets*."""
+        V_sub = V.sub(comp)
+        V_collapsed, _ = V_sub.collapse()
+        sym_dofs = locate_dofs_topological(
+            (V_sub, V_collapsed), fdim, facets)
+        sym_val = Function(V_collapsed)
+        sym_val.x.array[:] = 0.0
+        return dirichletbc(sym_val, sym_dofs, V_sub)
+
+    # Axis-aligned planes, in the order their parities are numbered below.
+    mirror_planes = []
     for sym_bc in fem.get("symmetry_bcs", []):
         if sym_bc.get("type") in ("diagonal", "rotational_c4"):
             continue  # handled via MPC below
         sym_facets = locate_entities_boundary(mesh, fdim, sym_bc["locator"])
         comp = sym_bc["component"]  # 0=x, 1=y, 2=z
-        # Constrain only the single DOF component (sub-space of V)
-        V_sub = V.sub(comp)
-        V_collapsed, _ = V_sub.collapse()
-        sym_dofs = locate_dofs_topological(
-            (V_sub, V_collapsed), fdim, sym_facets)
-        sym_val = Function(V_collapsed)
-        sym_val.x.array[:] = 0.0
-        sym_dirichlet = dirichletbc(sym_val, sym_dofs, V_sub)
-        bcs.append(sym_dirichlet)
+        mirror_planes.append((comp, sym_facets))
+        bcs.append(_component_bc(sym_facets, comp))
 
     # Build dolfinx_mpc MultiPointConstraint for non-axis-aligned symmetry
     mpc = None
@@ -230,15 +326,34 @@ def form_fem(fem, opt):
     # instead, and dropping duplicate facets to satisfy meshtags, would keep
     # whichever traction happened to be listed first and silently discard the
     # rest.
-    facet_load = {}
+    settings = direction_config
+    traction_facets = []
     for traction, traction_bc in fem["traction_bcs"]:
-        value = np.asarray(traction, dtype=float)
         if hasattr(traction_bc, '_facet_indices') and traction_bc._facet_indices is not None:
             current_facets = np.array(sorted(traction_bc._facet_indices), dtype=np.int32)
         else:
             current_facets = locate_entities_boundary(mesh, fdim, traction_bc)
-        for f in current_facets:
-            f = int(f)
+        traction_facets.append([int(f) for f in current_facets])
+
+    # An uncertain load needs its own facet group: its basis loads act where
+    # it acts, and a facet it shared with another load could not carry both
+    # markers.  Summing them is not an option either -- the other load would
+    # then be rotated along with this one.
+    uncertain = [i for i, (mode, _) in enumerate(settings) if mode != "fixed"]
+    for i in uncertain:
+        own = set(traction_facets[i])
+        for j, other in enumerate(traction_facets):
+            if j != i and own.intersection(other):
+                raise ValueError(
+                    f"load {i} has an uncertain direction but shares facets "
+                    f"with load {j}; give it a region of its own.")
+
+    facet_load = {}
+    for i, (traction, _) in enumerate(fem["traction_bcs"]):
+        if i in uncertain:
+            continue
+        value = np.asarray(traction, dtype=float)
+        for f in traction_facets[i]:
             if f in facet_load:
                 facet_load[f] = facet_load[f] + value
             else:
@@ -255,6 +370,12 @@ def form_fem(fem, opt):
         tractions.append(Constant(mesh, np.array(value, dtype=float)))
         facets.extend(group_facets)
         markers.extend([marker] * len(group_facets))
+
+    uncertain_markers = {}
+    for i in uncertain:
+        uncertain_markers[i] = len(tractions) + len(uncertain_markers)
+        facets.extend(traction_facets[i])
+        markers.extend([uncertain_markers[i]] * len(traction_facets[i]))
 
     facets = np.array(facets, dtype=np.int32)
     markers = np.array(markers, dtype=np.int32)
@@ -274,39 +395,123 @@ def form_fem(fem, opt):
     for marker, t in enumerate(tractions):
         rhs += ufl.dot(t, v)*ds(marker)
 
-    # Direction-uncertain load: the single applied traction may act in any
-    # direction, and the structure has to carry the worst one.  Sampling angles
-    # is unnecessary -- the compliance is a quadratic form in the load
-    # direction, so the whole angular range is spanned by `dim` orthogonal
-    # basis loads of equal magnitude on the same facets.  Their solutions
-    # combine linearly into the response for any direction; see
-    # Sensitivity.evaluate().
+    # Loads with an uncertain direction.  The compliance is a quadratic form
+    # in the applied load, so the response to any admissible load is a linear
+    # combination of the responses to a basis: `dim` orthogonal loads on the
+    # same facets for a free direction, two for a coordinate plane.  Sampling
+    # angles is unnecessary, and so is a second FEM solve for the nominal
+    # load -- it is a combination of the basis too, which is why the
+    # deterministic part of the load (fixed tractions and the body force)
+    # enters as leading basis vectors rather than as a separate solve.
+    # Sensitivity._evaluate_direction() reads the objective off them.
     opt["direction_rhs"] = None
-    opt["direction_mode"] = mode = direction_mode(fem)
-    opt["transverse_ratio"] = float(fem.get("transverse_ratio", 0.0))
-    if mode != "fixed":
+    opt["direction_modes"] = [mode for mode, _ in direction_config]
+    opt["direction_kappa"] = float(opt.get("direction_kappa", 1.0))
+    opt["direction_parity"] = None
+    opt["direction_bcs"] = None
+    if uncertain:
         gdim = mesh.geometry.dim
-        value = np.asarray(fem["traction_bcs"][0][0], dtype=float)
-        magnitude = float(np.linalg.norm(value))
+        forms, mean, cov_blocks, nominal, parity = [], [], [], [], []
 
-        if mode == "any":
-            # Every axis: the basis spans the whole sphere of directions.
-            directions = list(np.eye(gdim))
-        else:
-            # One coordinate plane, and inside it a basis aligned with the
-            # load rather than with the axes: the first vector is the load's
-            # own direction, so A[0,0] is the compliance of the load exactly
-            # as entered and the transverse ratio measures a perturbation
-            # against it.  The second spans what is left of the plane.
-            axes = PLANE_AXES[mode]
-            e_1, e_2 = np.zeros(gdim), np.zeros(gdim)
-            in_plane = value[list(axes)] / np.linalg.norm(value[list(axes)])
-            e_1[list(axes)] = in_plane
-            e_2[list(axes)] = (-in_plane[1], in_plane[0])
-            directions = [e_1, e_2]
+        # Every basis load is one Cartesian component on one facet group, so
+        # its parity about each mirror plane is decided by the axis alone:
+        # along the normal it is antisymmetric, along anything else
+        # symmetric.  A load can therefore be odd about at most one plane --
+        # the planes have distinct normals -- so the classes are "even about
+        # all of them" plus one per plane, not one per subset.
+        mirror_axes = [comp for comp, _ in mirror_planes]
 
-        opt["direction_rhs"] = [
-            ufl.dot(Constant(mesh, d*magnitude), v)*ds(0) for d in directions]
+        def parity_of(axis):
+            """Which class a load along *axis* falls into: 0 is even."""
+            return mirror_axes.index(axis) + 1 if axis in mirror_axes else 0
+
+        # The deterministic part splits the same way.  A traction t on a
+        # mirror-symmetric region is neither even nor odd unless it happens to
+        # be tangential or normal, but t = t_tangential + t_normal is exactly
+        # that decomposition, and each piece extends across the plane with the
+        # parity that reproduces the load the user entered.  Without symmetry
+        # planes there is nothing to split and this is the whole right-hand
+        # side, as before.
+        body = np.asarray(fem["body_force"], dtype=float)
+        deterministic = {}
+
+        def _add(cls, form_term):
+            deterministic[cls] = (deterministic.get(cls, 0) + form_term
+                                  if cls in deterministic else form_term)
+
+        def _split(vector, measure):
+            """Add *vector*'s parity components over *measure*."""
+            for cls in range(len(mirror_axes) + 1):
+                part = np.zeros(gdim)
+                if cls == 0:
+                    keep = [a for a in range(gdim) if a not in mirror_axes]
+                else:
+                    keep = [mirror_axes[cls - 1]]
+                part[keep] = vector[keep]
+                if np.any(part):
+                    _add(cls, ufl.dot(Constant(mesh, part), v)*measure)
+
+        if np.any(body):
+            _split(body, dx)
+        for marker, t in enumerate(tractions):
+            _split(np.asarray(t.value, dtype=float), ds(marker))
+
+        for cls in sorted(deterministic):
+            # Certain, hence mean 1 and no scatter, but still part of the
+            # quadratic form: its cross terms with the uncertain loads are
+            # what makes the objective see them acting together.
+            forms.append(deterministic[cls])
+            mean.append([1.0])
+            nominal.append([1.0])
+            cov_blocks.append(np.zeros((1, 1)))
+            parity.append(cls)
+
+        for i in uncertain:
+            mode, ratio = direction_config[i]
+            value = np.asarray(fem["traction_bcs"][i][0], dtype=float)
+            directions, magnitude, nom, mean_i, cov_i = _load_basis(
+                mode, ratio, value, gdim)
+            marker = uncertain_markers[i]
+            for d in directions:
+                forms.append(ufl.dot(Constant(mesh, d*magnitude), v)*ds(marker))
+                parity.append(parity_of(int(np.argmax(np.abs(d)))))
+            mean.append(mean_i)
+            nominal.append(nom)
+            cov_blocks.append(cov_i)
+
+        size = sum(len(block) for block in cov_blocks)
+        covariance = np.zeros((size, size))
+        offset = 0
+        for block in cov_blocks:
+            end = offset + len(block)
+            covariance[offset:end, offset:end] = block
+            offset = end
+
+        opt["direction_rhs"] = forms
+        opt["direction_mu"] = np.concatenate(mean)
+        opt["direction_nominal"] = np.concatenate(nominal)
+        opt["direction_cov"] = covariance
+        opt["direction_parity"] = parity
+
+        if mirror_planes:
+            # One boundary condition set per class.  Even about a plane is
+            # the usual roller -- normal component pinned, the rest free.
+            # Odd is its complement: the response is antisymmetric, so it is
+            # the tangential components that vanish on the plane while the
+            # normal one is free to move.
+            classes = []
+            for cls in range(len(mirror_planes) + 1):
+                class_bcs = [bc]
+                for index, (comp, facets) in enumerate(mirror_planes):
+                    if cls == index + 1:
+                        for other in range(dim):
+                            if other != comp:
+                                class_bcs.append(_component_bc(facets, other))
+                    else:
+                        class_bcs.append(_component_bc(facets, comp))
+                classes.append(class_bcs)
+            opt["direction_bcs"] = classes
+
     if opt["opt_compliance"]:
         spring_vec = opt["l_vec"] = None
     else:
@@ -346,7 +551,9 @@ def form_fem(fem, opt):
 
     linear_problem = LinearProblem(u_field, lambda_field, lhs, rhs, opt["l_vec"],
                                    spring_vec, bcs, fem["petsc_options"],
-                                   mpc=mpc, direction_rhs=opt["direction_rhs"])
+                                   mpc=mpc, direction_rhs=opt["direction_rhs"],
+                                   direction_bcs=opt["direction_bcs"],
+                                   direction_parity=opt["direction_parity"])
 
     # When MPC is active, re-create u_field and lambda_field from the MPC's
     # function space.  After mpc.finalize(), the MPC replaces V's index map

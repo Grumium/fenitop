@@ -140,9 +140,56 @@ def resolve_petsc_options(petsc_options, comm=None):
     return opts
 
 
+class _ParitySolver:
+    """The same stiffness form under a different set of Dirichlet conditions.
+
+    Used for the basis loads that are antisymmetric about a mirror plane: the
+    operator differs from the symmetric one only in which rows the boundary
+    conditions clear, so it shares the form, the density and the mesh, and
+    needs its own matrix, its own factorization and nothing else.
+
+    Deliberately without the GAMG rebuild heuristics of LinearProblem: those
+    track a history per operator, and an antisymmetric solve is the same
+    problem at the same contrast as the symmetric one it accompanies, so the
+    main operator's judgement carries over.
+    """
+
+    def __init__(self, lhs_form, bcs, petsc_options, comm):
+        self.lhs_form = lhs_form
+        self.bcs = bcs
+        self.mat = create_matrix(lhs_form)
+        self.solver = PETSc.KSP().create(comm)
+        self.solver.setOperators(self.mat)
+        prefix = f"parity_solver_{id(self)}"
+        self.solver.setOptionsPrefix(prefix)
+        opts = PETSc.Options()
+        opts.prefixPush(prefix)
+        for key, value in petsc_options.items():
+            opts[key] = value
+        opts.prefixPop()
+        self.solver.setFromOptions()
+
+    def assemble(self, spring_vec=None):
+        self.mat.zeroEntries()
+        assemble_matrix(self.mat, self.lhs_form, bcs=self.bcs)
+        self.mat.assemble()
+        if spring_vec is not None:
+            self.mat.setDiagonal(self.mat.getDiagonal() + spring_vec)
+
+    def solve(self, rhs_vec, u_out):
+        self.solver.solve(rhs_vec, u_out)
+        reason = self.solver.getConvergedReason()
+        if reason < 0:
+            raise RuntimeError(
+                f"the antisymmetric solve did not converge (KSP reason "
+                f"{reason} after {self.solver.getIterationNumber()} "
+                f"iterations)")
+
+
 class LinearProblem:
     def __init__(self, u, lam, lhs, rhs, l_vec, spring_vec, bcs=[], petsc_options={},
-                 mpc=None, direction_rhs=None):
+                 mpc=None, direction_rhs=None, direction_bcs=None,
+                 direction_parity=None):
         """Initialize a linear problem.
 
         Parameters
@@ -151,11 +198,22 @@ class LinearProblem:
             If provided, assembly and solve use dolfinx_mpc routines to
             enforce multi-point constraints (e.g. diagonal symmetry slip BCs).
         direction_rhs : list of ufl.Form, optional
-            Extra right-hand sides for a direction-uncertain load, one per
-            spatial direction.  They are solved alongside the main one in
+            Right-hand sides spanning the loads a direction-uncertain problem
+            admits: the deterministic part, then a basis per uncertain load.
+            They are solved instead of the nominal one in
             solve_fem() and land in `self.u_dir`.  Each costs one more Krylov
             solve or back-substitution, not another assembly or factorization:
             the operator is shared, only the load differs.
+        direction_bcs : list of list, optional
+            One boundary condition set per parity class, for a symmetric half
+            domain carrying an uncertain load.  A load antisymmetric about a
+            mirror plane has an antisymmetric response, which the roller
+            condition of the symmetric case cannot represent, so those basis
+            loads are solved against their own operator.  Only the boundary
+            conditions differ, so the extra cost is one assembly and one
+            factorization per class in use -- both on the reduced domain.
+        direction_parity : list of int, optional
+            Which of those sets each entry of `direction_rhs` belongs to.
         """
         # Downgrade any solver this PETSc build was not compiled with, before
         # the choice reaches KSPSetUp where it would fail opaquely.
@@ -209,6 +267,21 @@ class LinearProblem:
         self.rhs_dir = [create_vector(f.function_spaces[0])
                         for f in self.direction_forms]
         self.u_dir = [self.u_wrap.copy() for _ in self.direction_forms]
+
+        self.direction_bcs = direction_bcs
+        # Parity classes.  Class 0 is the ordinary set held in self.bcs, so it
+        # rides along on the main operator and only the others need one of
+        # their own -- and only those actually carrying a basis load.
+        self.direction_parity = list(direction_parity or
+                                     [0]*len(self.direction_forms))
+        self.parity_solvers = {}
+        if direction_bcs and len(direction_bcs) > 1:
+            for cls in sorted(set(self.direction_parity)):
+                if cls == 0:
+                    continue
+                self.parity_solvers[cls] = _ParitySolver(
+                    self.lhs_form, direction_bcs[cls], petsc_options,
+                    u.function_space.mesh.comm)
 
         # Construct a linear solver
         self.solver = PETSc.KSP().create(self.u.function_space.mesh.comm)
@@ -379,12 +452,19 @@ class LinearProblem:
         self.rhs_vec.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
         set_bc(self.rhs_vec, self.bcs)
 
-        for vec, frm in zip(self.rhs_dir, self.direction_forms):
+        for vec, frm, cls in zip(self.rhs_dir, self.direction_forms,
+                                 self.direction_parity):
             assemble_vector(vec, frm)
             if self.mpc is not None:
                 self._dmpc.apply_lifting(vec, [self.lhs_form], [self.bcs], self.mpc)
             vec.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
-            set_bc(vec, self.bcs)
+            # Each basis load is cleared by *its own* conditions, not by the
+            # symmetric set.  A load antisymmetric about a mirror plane pushes
+            # along the plane normal, which is exactly the component the
+            # symmetric roller pins -- clearing it here would silently drop
+            # the load carried by the nodes on the plane, and with it a slice
+            # of the compliance that grows with the mesh.
+            set_bc(vec, self._class_bcs(cls))
 
     def _rescale_bc_diagonal(self):
         """Put the constrained rows on the same scale as the physical ones.
@@ -541,6 +621,12 @@ class LinearProblem:
             print(f"  🔄 Beta change{beta_str}: forcing GAMG rebuild + "
                   f"initial-guess reset.", flush=True)
 
+    def _class_bcs(self, cls):
+        """The boundary conditions a basis load of parity *cls* is solved with."""
+        if not self.direction_bcs or cls == 0:
+            return self.bcs
+        return self.direction_bcs[cls]
+
     def solve_fem(self):
         """Solve K*x=F for FEM."""
         comm = self.u.function_space.mesh.comm
@@ -580,11 +666,17 @@ class LinearProblem:
             # would be a wasted solve per iteration.  They share the operator,
             # hence the factorization or preconditioner, and cost only a
             # back-substitution or a Krylov run each.
-            for vec, u_k in zip(self.rhs_dir, self.u_dir):
-                set_bc(vec, self.bcs)
-                self.solver.solve(vec, u_k)
+            for solver in self.parity_solvers.values():
+                solver.assemble(self.spring_vec)
+            for vec, u_k, cls in zip(self.rhs_dir, self.u_dir,
+                                     self.direction_parity):
+                if cls in self.parity_solvers:
+                    self.parity_solvers[cls].solve(vec, u_k)
+                else:
+                    set_bc(vec, self.bcs)
+                    self.solver.solve(vec, u_k)
             # Keep u_field a valid field: Sensitivity replaces it with the
-            # worst-case combination, but callbacks may read it before that.
+            # nominal load's response, but callbacks may read it before that.
             self.u_dir[0].copy(self.u_wrap)
         else:
             self.solver.solve(self.rhs_vec, self.u_wrap)

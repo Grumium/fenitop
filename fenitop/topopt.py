@@ -36,6 +36,7 @@ import dolfinx.la
 from fenitop.fem import form_fem
 from fenitop.parameterize import DensityFilter, Heaviside
 from fenitop.sensitivity import Sensitivity
+from fenitop.design_symmetry import DesignSymmetry
 from fenitop.optimize import optimality_criteria, mma_optimizer
 from fenitop.utility import Communicator, save_xdmf, save_vtkhdf
 
@@ -131,6 +132,16 @@ def topopt(fem, opt, on_iteration=None, on_setup=None, on_finish=None):
 
         solid_nodes = _interior_nodes(solid)
         void_nodes = _interior_nodes(void)
+
+    # Symmetric design without a reduced domain.  The planes here are the
+    # ones the run does not exploit -- typically because an uncertain load
+    # direction rules out halving -- so the symmetry the user asked for is
+    # imposed on the design instead of on the solve.
+    design_symmetry = DesignSymmetry(comm, rho_field,
+                                     opt.get("design_symmetry_planes"))
+    if design_symmetry and rank == 0:
+        print(f"  ⚖️  Symmetric design enforced over {design_symmetry.group_size} "
+              f"orbit position(s) per cell", flush=True)
 
     sens_problem = Sensitivity(comm, opt, linear_problem, u_field, lambda_field, rho_phys_field)
     S_comm = Communicator(rho_field.function_space, fem["mesh_serial"])
@@ -253,6 +264,13 @@ def topopt(fem, opt, on_iteration=None, on_setup=None, on_finish=None):
         else:
             g_vec = np.array([V_value-opt["vol_frac"], C_value-opt.get("compliance_bound", 1e9)])
             dJdrho, dgdrho = dUdrho, np.vstack([dVdrho, dCdrho])
+        # Project the sensitivities onto the symmetric subspace before the
+        # step, so the optimizer never proposes a step that leaves it.  The
+        # projector is symmetric, which is exactly what the chain rule wants
+        # for a design constrained to that subspace.
+        if design_symmetry:
+            dJdrho = design_symmetry.apply(dJdrho)
+            dgdrho = np.vstack([design_symmetry.apply(row) for row in dgdrho])
         stats.stop('sensitivity')
 
         # Update the design variables (use only owned DOFs, not ghosts)
@@ -268,6 +286,13 @@ def topopt(fem, opt, on_iteration=None, on_setup=None, on_finish=None):
                 rho_old1, rho_old2, dJdrho, g_vec, dgdrho, low, upp, opt["move"])
             rho_old2 = rho_old1.copy()
             rho_old1 = rho_values.copy()
+
+        # The update is elementwise, so a symmetric iterate and symmetric
+        # sensitivities keep it symmetric -- but the filter runs on an
+        # unstructured mesh, and its round-off would accumulate over hundreds
+        # of iterations.  Re-projecting costs one more MatMult.
+        if design_symmetry:
+            rho_new = design_symmetry.apply(rho_new)
 
         # Check for NaN values and stop optimization if detected
         if np.isnan(change) or np.any(np.isnan(rho_new)):

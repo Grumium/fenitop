@@ -49,30 +49,46 @@ class Sensitivity():
         self.dCdrho_form = form(-ufl.derivative(opt["compliance"], rho_phys))
         self.dCdrho_vec = create_vector(self.dCdrho_form.function_spaces[0])
 
-        # Direction-uncertain load.  The compliance of a load of fixed
-        # magnitude acting in direction d is the quadratic form d^T A d, with
-        # A[i,j] = f_i . u_j over the orthogonal basis loads assembled in
-        # form_fem().  So the worst direction over the *entire* angular range
-        # is the largest eigenvalue of a dim x dim matrix -- no angle sampling.
+        # Load with an uncertain direction.  The compliance of the load
+        # sum_i c_i f_i is the quadratic form c^T A c with A[i,j] = f_i . u_j
+        # over the basis loads assembled in form_fem(), so once the basis is
+        # solved every statistic of the compliance follows from a matrix of
+        # side `len(direction_rhs)` -- no angle sampling, and no further FEM
+        # solves whatever the load distribution is.
         #
-        # Optimizing max(lambda) directly does not work: the eigenvalues
-        # coalesce exactly when the design carries all directions equally,
-        # which is the optimum this is aiming for, and max() is
-        # non-differentiable there.  A p-norm over the eigenvalues is smooth,
-        # and for dim <= 3 it overestimates the true worst case by at most
-        # dim**(1/p) -- 9% for p = 8 in 2D, and only where the directions are
-        # already balanced.
+        # Modelling c as a random vector of mean `mu` and covariance `cov`
+        # rather than as a member of a set, both moments are closed form:
+        #
+        #     E[C]   = <A, mu mu^T + cov>
+        #     Var[C] = 2 tr(A cov A cov) + 4 mu^T A cov A mu
+        #
+        # and the objective is their 2-norm, following Torii (CMAME 352,
+        # 2019): J = sqrt(E^2 + (kappa*sd)^2).  The familiar weighted sum
+        # E + kappa*sd is the same expression with the 1-norm, for which no
+        # proof of physical consistency is available; for the 2-norm,
+        # kappa <= 1 -- no more weight on the scatter than on the mean --
+        # guarantees it.  Both moments are polynomial in A, so the objective
+        # is smooth everywhere: no eigenvalues to coalesce, no |.| to floor,
+        # and nothing whose sign can flip between iterations.
         self.direction_rhs = opt.get("direction_rhs") is not None
         self.u_field = u_field
         if self.direction_rhs:
             self.problem = problem
-            self.direction_mode = opt.get("direction_mode", "any")
-            self.transverse_ratio = float(opt.get("transverse_ratio", 0.0))
-            self.p_norm = float(opt.get("direction_p_norm", 8.0))
-            # Relative floor for the |A12| kink below, as a fraction of the
-            # Cauchy-Schwarz bound sqrt(A11*A22) so it carries no units.
-            self.transverse_smoothing = float(
-                opt.get("transverse_smoothing", 1e-3))
+            self.dir_mu = np.asarray(opt["direction_mu"], dtype=float)
+            self.dir_cov = np.asarray(opt["direction_cov"], dtype=float)
+            self.dir_kappa = float(opt.get("direction_kappa", 1.0))
+            # The load to show in the viewer.  The worst case is no longer
+            # the field being optimized -- the objective covers a whole
+            # distribution -- so the nominal load is both the honest choice
+            # and a stable one from iteration to iteration.
+            self.dir_nominal = np.asarray(
+                opt.get("direction_nominal", self.dir_mu), dtype=float)
+            # Which parity class each basis load belongs to on a symmetric
+            # half domain; all zeros when the domain is whole.
+            self.dir_parity = np.asarray(
+                opt.get("direction_parity")
+                or [0]*len(opt["direction_rhs"]), dtype=int)
+            self.dCdrho_dir = create_vector(self.dCdrho_form.function_spaces[0])
             self.dCdrho_dir = create_vector(self.dCdrho_form.function_spaces[0])
 
         # Volume
@@ -122,84 +138,23 @@ class Sensitivity():
                                     mode=PETSc.ScatterMode.REVERSE)
         return self.dCdrho_dir
 
-    def _evaluate_transverse(self, A):
-        """Main load plus an orthogonal perturbation of at most `eps` of it.
-
-        With the basis aligned to the load, the admissible coefficient is
-        c = (1, s) with |s| <= eps, so the compliance is the scalar parabola
-        A11 + 2*A12*s + A22*s^2.  A22 >= 0 makes it convex, so the worst case
-        sits on an endpoint and is closed form -- no eigenproblem, no root
-        find:
-
-            C = A11 + eps^2*A22 + 2*eps*|A12|
-
-        |A12| kinks at zero, which is not a corner case but the norm: A12
-        vanishes identically whenever the structure is symmetric about the
-        load, and then both signs of the perturbation are equally bad.  The
-        modulus is therefore floored by delta = c*sqrt(A11*A22), which at
-        A12 = 0 yields the average of the two one-sided derivatives.
-
-        Note that delta is itself a function of the design, so differentiating
-        the floored modulus is not simply the sensitivity at the worst-case
-        load -- treating delta as a constant leaves a relative error that
-        grows with the smoothing (0.03% at c = 1e-2, which a finite-difference
-        check picks up).  All three entries of A are therefore differentiated
-        separately and recombined.
-        """
-        eps = self.transverse_ratio
-        A11, A12, A22 = A[0, 0], A[0, 1], A[1, 1]
-        c = self.transverse_smoothing
-
-        W2 = max(A11*A22, 0.0)
-        modulus = float(np.sqrt(A12*A12 + c*c*W2))
-        C_value = A11 + eps*eps*A22 + 2.0*eps*modulus
-
-        # dC/drho = w11*A11' + w22*A22' + w12*A12', from
-        #   d|A12|_smoothed = [A12*A12' + c^2*(A11'*A22 + A11*A22')/2] / modulus
-        if modulus > 0.0:
-            w11 = 1.0 + eps*c*c*A22/modulus
-            w22 = eps*eps + eps*c*c*A11/modulus
-            w12 = 2.0*eps*A12/modulus
-        else:                      # A12 == 0 and no smoothing: subgradient 0
-            w11, w22, w12 = 1.0, eps*eps, 0.0
-
-        # A11' and A22' come straight from the derivative form; the cross term
-        # is recovered by polarization, since the form is quadratic in u:
-        #   Q(u1 + u2) = Q(u1) + 2*A12' + Q(u2).
-        # Three assemblies of an existing form, and no further FEM solves.
-        d11 = self._combine([1.0, 0.0]).copy()
-        d22 = self._combine([0.0, 1.0]).copy()
-        d_sum = self._combine([1.0, 1.0])
-
-        self._store(d_sum)
-        self.dCdrho_vec.scale(0.5*w12)
-        self.dCdrho_vec.axpy(w11 - 0.5*w12, d11)
-        self.dCdrho_vec.axpy(w22 - 0.5*w12, d22)
-        d11.destroy()
-        d22.destroy()
-
-        # Leave u_field on the worst-case load, which is what the viewer shows.
-        sign = 1.0 if A12 >= 0.0 else -1.0
-        self._combine([1.0, eps*sign])
-        return C_value
-
-    def _store(self, vector):
-        with self.dCdrho_vec.localForm() as loc:
-            loc.set(0)
-        self.dCdrho_vec.axpy(1.0, vector)
-
     def _evaluate_direction(self):
-        """Worst-case compliance over the admissible loads, and its gradient.
+        """Objective over the load distribution, and its gradient.
 
-        The compliance of the load sum_i c_i f_i is the quadratic form c^T A c
-        with A[i,j] = f_i . u_j, so once the basis is solved the worst case is
-        a tiny optimization over c on a 2x2 or 3x3 matrix -- no further FEM
-        solves, whatever shape the admissible set has.  Which shape it is
-        depends on the mode: the whole unit sphere ("any"), or the main
-        direction with a bounded orthogonal perturbation (a coordinate plane).
+        Assembles A once from the basis solutions, reads both moments off it
+        in closed form, and turns the derivative of the objective with
+        respect to A into a design sensitivity.
 
-        Leaves u_field holding the worst case's displacement, which is the
-        field worth looking at, and the one the viewer shows.
+        That last step is the only part worth explaining.  dJ/drho is
+        sum_ij G_ij * dA_ij/drho with G = dJ/dA, and dA_ij/drho = -u_i^T K'
+        u_j, which is not a form we have -- `_combine` gives the quadratic
+        form Q(c) = sum_ij c_i c_j dA_ij/drho for one coefficient vector.
+        Diagonalizing G = sum_k g_k w_k w_k^T therefore recovers exactly
+        what is needed as sum_k g_k Q(w_k): `n` assemblies of an existing
+        form, no further solves, and quadratic in each w_k, so the arbitrary
+        sign of an eigenvector cannot reach the result.
+
+        Leaves u_field on the nominal load, which is what the viewer shows.
         """
         loads, disps = self.problem.rhs_dir, self.problem.u_dir
         n = len(loads)
@@ -210,33 +165,64 @@ class Sensitivity():
                       for i in range(n)])
         A = 0.5*(A + A.T)          # symmetric by construction, not by round-off
 
-        if self.direction_mode != "any":
-            return self._evaluate_transverse(A)
+        # On a reduced domain the dot products cover the kept fraction only,
+        # while the derivative form already carries the factor -- so A has to
+        # be scaled to match it, or objective and gradient describe different
+        # structures.
+        A *= self.sym_factor
 
-        lam, vecs = np.linalg.eigh(A)
-        lam = np.clip(lam, 0.0, None)   # A is positive semidefinite
+        # Across parity classes the entry is exactly zero on the full domain:
+        # a symmetric field paired with an antisymmetric load integrates to
+        # nothing.  On the half domain the same product does not cancel, so
+        # what the dot returns there is an artefact of the reduction and is
+        # dropped rather than believed.  It follows that the gradient may only
+        # combine fields within a class, which is what the block loop below
+        # does -- combining across would assemble the same artefact into the
+        # sensitivity.
+        same_class = self.dir_parity[:, None] == self.dir_parity[None, :]
+        A = np.where(same_class, A, 0.0)
 
-        peak = lam[-1]                  # eigh returns them ascending
-        if peak <= 0.0:
+        mu, cov, kappa = self.dir_mu, self.dir_cov, self.dir_kappa
+        P = np.outer(mu, mu)
+        A_cov = A @ cov
+
+        mean = float(np.sum(A*(P + cov)))
+        # Clipped because round-off can take a variance of zero -- a load with
+        # no scatter left, or a design that carries every direction alike --
+        # a little below it.
+        variance = max(float(2.0*np.trace(A_cov @ A_cov)
+                             + 4.0*(mu @ A_cov @ A @ mu)), 0.0)
+        J = float(np.sqrt(mean*mean + kappa*kappa*variance))
+
+        if J <= 0.0:               # no load reaches the structure
             with self.dCdrho_vec.localForm() as loc:
                 loc.set(0)
+            self._combine(self.dir_nominal)
             return 0.0
 
-        # Scaled p-norm: (sum lam^p)^(1/p) = peak * S^(1/p), which keeps
-        # lam**p from overflowing for a stiff design.
-        ratios = lam/peak
-        S = float(np.sum(ratios**self.p_norm))
-        C_value = peak * S**(1.0/self.p_norm)
-        dCdlam = S**(1.0/self.p_norm - 1.0) * ratios**(self.p_norm - 1.0)
+        # dJ/dA = [E*dE/dA + kappa^2*dVar/dA / 2] / J, with
+        #   dE/dA   = mu mu^T + cov
+        #   dVar/dA = 4 cov A cov + 4 (mu mu^T A cov + cov A mu mu^T)
+        cross = P @ A_cov
+        G = (mean*(P + cov)
+             + 2.0*kappa*kappa*(cov @ A_cov + cross + cross.T)) / J
 
-        # dlambda_k/drho is the ordinary compliance sensitivity evaluated at
-        # the combined field sum_i vecs[i,k]*u_i, because
-        # d(f^T K^-1 f)/drho = -u^T K' u carries over to the eigenpair.
+        G = np.where(same_class, 0.5*(G + G.T), 0.0)
         with self.dCdrho_vec.localForm() as loc:
             loc.set(0)
-        for k in range(n):           # ascending, so u_field ends on the worst
-            self.dCdrho_vec.axpy(float(dCdlam[k]), self._combine(vecs[:, k]))
-        return C_value
+        for cls in np.unique(self.dir_parity):
+            block = np.flatnonzero(self.dir_parity == cls)
+            weights, vecs = np.linalg.eigh(G[np.ix_(block, block)])
+            for k in range(len(block)):
+                if weights[k] == 0.0:
+                    continue
+                coefficients = np.zeros(n)
+                coefficients[block] = vecs[:, k]
+                self.dCdrho_vec.axpy(float(weights[k]),
+                                     self._combine(coefficients))
+
+        self._combine(self.dir_nominal)
+        return J
 
     def evaluate(self):
         # Compliance
